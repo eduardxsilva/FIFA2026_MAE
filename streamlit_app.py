@@ -439,7 +439,7 @@ if page == "🏠 Dashboard":
             title="Partidas por ano",
         )
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, width=stretch)
+        st.plotly_chart(fig, width='stretch')
 
         c1, c2 = st.columns(2)
         with c1:
@@ -447,9 +447,9 @@ if page == "🏠 Dashboard":
             top_home.columns = ["Equipe", "Jogos como mandante"]
             fig_home = px.bar(top_home, x="Jogos como mandante", y="Equipe", orientation="h", title="Top mandantes")
             fig_home.update_layout(height=430, yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig_home, width=stretch)
+            st.plotly_chart(fig_home, width='stretch')
         with c2:
-            st.dataframe(df.tail(20), width=stretch, hide_index=True)
+            st.dataframe(df.tail(20), width='stretch', hide_index=True)
 
 
 # ============================================================
@@ -472,7 +472,7 @@ elif page == "🌐 Importar dados":
         with c2:
             incluir_fifa = st.checkbox("Coletar páginas FIFA", value=True)
 
-        if st.button("🌐 Extrair base da internet", type="primary", width=stretch):
+        if st.button("🌐 Extrair base da internet", type="primary", width='stretch'):
             try:
                 with st.spinner("Extraindo e padronizando dados online..."):
                     extractor = InternetDataExtractor(timeout=35)
@@ -492,7 +492,7 @@ elif page == "🌐 Importar dados":
                     st.session_state[key] = None
 
                 st.success("Base extraída com sucesso.")
-                st.dataframe(result.matches.head(30), width=stretch, hide_index=True)
+                st.dataframe(result.matches.head(30), width='stretch', hide_index=True)
                 with st.expander("Ver log da extração"):
                     st.code("\n".join(result.log))
             except Exception as e:
@@ -501,7 +501,7 @@ elif page == "🌐 Importar dados":
     with tab_file:
         uploaded = st.file_uploader("Selecione .xlsx, .xls ou .csv", type=["xlsx", "xls", "csv"])
         if uploaded is not None:
-            if st.button("📁 Carregar planilha", type="primary", width=stretch):
+            if st.button("📁 Carregar planilha", type="primary", width='stretch'):
                 suffix = Path(uploaded.name).suffix.lower()
                 try:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -524,7 +524,7 @@ elif page == "🌐 Importar dados":
                         st.session_state[key] = None
 
                     st.success("Planilha carregada com sucesso.")
-                    st.dataframe(df.head(30), width=stretch, hide_index=True)
+                    st.dataframe(df.head(30), width='stretch', hide_index=True)
                 except Exception as e:
                     st.error(f"Erro ao carregar: {e}")
 
@@ -546,7 +546,7 @@ elif page == "🧠 Treinar modelos":
         with c2:
             st.metric("Equipes", len(set(st.session_state.df_matches["home_team"]).union(set(st.session_state.df_matches["away_team"]))))
 
-        if st.button("🚀 Treinar todos os modelos", type="primary", width=stretch):
+        if st.button("🚀 Treinar todos os modelos", type="primary", width='stretch'):
             try:
                 with st.spinner("Treinando Elo, xG, Poisson, Dixon-Coles, bivariada, ML e Ensemble..."):
                     treinar_modelos()
@@ -559,15 +559,15 @@ elif page == "🧠 Treinar modelos":
             df_elo = st.session_state.df_elo.copy()
             c1, c2 = st.columns([1.25, 1])
             with c1:
-                st.dataframe(df_elo.head(40), width=stretch, hide_index=True)
+                st.dataframe(df_elo.head(40), width='stretch', hide_index=True)
             with c2:
                 top = df_elo.head(15).sort_values("Elo")
                 fig = px.bar(top, x="Elo", y="Equipe", orientation="h", title="Top 15 por Elo")
                 fig.update_layout(height=520)
-                st.plotly_chart(fig, width=stretch)
+                st.plotly_chart(fig, width='stretch')
 
             with st.expander("Ver forças ofensivas/defensivas"):
-                st.dataframe(st.session_state.df_team_stats, width=stretch, hide_index=True)
+                st.dataframe(st.session_state.df_team_stats, width='stretch', hide_index=True)
 
 
 # ============================================================
@@ -591,7 +591,7 @@ elif page == "🎯 Prever partida":
         with c3:
             competicao = st.text_input("Competição", value="Não informado")
 
-        if st.button("⚡ Calcular previsão", type="primary", width=stretch):
+        if st.button("⚡ Calcular previsão", type="primary", width='stretch'):
             if mandante == visitante:
                 st.error("Escolha equipes diferentes.")
             else:
@@ -640,11 +640,11 @@ elif page == "🎯 Prever partida":
             with c1:
                 fig = px.bar(prob_df, x="Resultado", y="Probabilidade", title="Probabilidades 1X2 — Ensemble", text="Probabilidade")
                 fig.update_layout(height=390, yaxis_title="%")
-                st.plotly_chart(fig, width=stretch)
+                st.plotly_chart(fig, width='stretch')
             with c2:
                 fig2 = px.bar(lambda_df, x="Equipe", y="xG esperado", title="xG esperado / intensidade ofensiva", text="xG esperado")
                 fig2.update_layout(height=390)
-                st.plotly_chart(fig2, width=stretch)
+                st.plotly_chart(fig2, width='stretch')
 
             c1, c2 = st.columns(2)
             with c1:
@@ -658,16 +658,16 @@ elif page == "🎯 Prever partida":
                         {"Métrica": "Over 2.5", "Valor": f"{r['prob_over_25']}%"},
                         {"Métrica": "Ambas marcam", "Valor": f"{r['prob_btts']}%"},
                     ]),
-                    width=stretch,
+                    width='stretch',
                     hide_index=True,
                 )
             with c2:
                 st.markdown("#### 🔢 Placares mais prováveis")
-                st.dataframe(pd.DataFrame(r["top_placares"]), width=stretch, hide_index=True)
+                st.dataframe(pd.DataFrame(r["top_placares"]), width='stretch', hide_index=True)
 
             if r_ml:
                 with st.expander("Ver previsão separada do Machine Learning"):
-                    st.dataframe(pd.DataFrame([r_ml]), width=stretch, hide_index=True)
+                    st.dataframe(pd.DataFrame([r_ml]), width='stretch', hide_index=True)
 
 
 # ============================================================
@@ -685,7 +685,7 @@ elif page == "🏆 Simulações":
 
         with tab_ko:
             iteracoes = st.number_input("Simulações", min_value=100, max_value=30000, value=3000, step=500, key="it_ko")
-            if st.button("🏆 Simular mata-mata", type="primary", width=stretch):
+            if st.button("🏆 Simular mata-mata", type="primary", width='stretch'):
                 try:
                     with st.spinner("Simulando torneios..."):
                         df_sim = st.session_state.simulador_campeao.simular_campeao(iteracoes=int(iteracoes))
@@ -698,12 +698,12 @@ elif page == "🏆 Simulações":
                 df_sim = st.session_state.df_simulacao_campeao.head(25).copy()
                 fig = px.bar(df_sim.sort_values("Probabilidade_Titulo_%"), x="Probabilidade_Titulo_%", y="Equipe", orientation="h", title="Probabilidade de título — mata-mata")
                 fig.update_layout(height=650)
-                st.plotly_chart(fig, width=stretch)
-                st.dataframe(st.session_state.df_simulacao_campeao, width=stretch, hide_index=True)
+                st.plotly_chart(fig, width='stretch')
+                st.dataframe(st.session_state.df_simulacao_campeao, width='stretch', hide_index=True)
 
         with tab_wc:
             iteracoes_copa = st.number_input("Simulações", min_value=100, max_value=20000, value=1000, step=500, key="it_wc")
-            if st.button("🌍 Simular formato Copa 2026", type="primary", width=stretch):
+            if st.button("🌍 Simular formato Copa 2026", type="primary", width='stretch'):
                 try:
                     with st.spinner("Simulando fase de grupos e mata-mata..."):
                         df_wc, ultima = st.session_state.simulador_copa.simular_campeao_formato_copa(iteracoes=int(iteracoes_copa))
@@ -717,13 +717,13 @@ elif page == "🏆 Simulações":
                 top = st.session_state.df_simulacao_copa.head(25).copy()
                 fig = px.bar(top.sort_values("Prob_Titulo_%"), x="Prob_Titulo_%", y="Equipe", orientation="h", title="Probabilidade de título — Copa aproximada")
                 fig.update_layout(height=650)
-                st.plotly_chart(fig, width=stretch)
-                st.dataframe(st.session_state.df_simulacao_copa, width=stretch, hide_index=True)
+                st.plotly_chart(fig, width='stretch')
+                st.dataframe(st.session_state.df_simulacao_copa, width='stretch', hide_index=True)
 
                 if st.session_state.ultima_copa_simulada is not None:
                     with st.expander("Ver última Copa simulada"):
-                        st.dataframe(st.session_state.ultima_copa_simulada["classificados"], width=stretch, hide_index=True)
-                        st.dataframe(st.session_state.ultima_copa_simulada["mata_mata"], width=stretch, hide_index=True)
+                        st.dataframe(st.session_state.ultima_copa_simulada["classificados"], width='stretch', hide_index=True)
+                        st.dataframe(st.session_state.ultima_copa_simulada["mata_mata"], width='stretch', hide_index=True)
 
 
 # ============================================================
@@ -745,7 +745,7 @@ elif page == "📈 Validação":
         with c3:
             st.markdown("<div class='soft-text'>A validação treina com jogos antigos e prevê jogos posteriores, evitando vazamento de dados.</div>", unsafe_allow_html=True)
 
-        if st.button("📈 Rodar validação", type="primary", width=stretch):
+        if st.button("📈 Rodar validação", type="primary", width='stretch'):
             try:
                 with st.spinner("Rodando backtest temporal..."):
                     validator = ModelBacktester()
@@ -763,7 +763,7 @@ elif page == "📈 Validação":
 
         if st.session_state.df_validacao_resumo is not None:
             st.markdown("#### Métricas")
-            st.dataframe(st.session_state.df_validacao_resumo, width=stretch, hide_index=True)
+            st.dataframe(st.session_state.df_validacao_resumo, width='stretch', hide_index=True)
 
             resumo_long = st.session_state.df_validacao_resumo.melt(
                 id_vars=["Modelo", "Partidas_Avaliadas"],
@@ -773,10 +773,10 @@ elif page == "📈 Validação":
             )
             fig = px.bar(resumo_long, x="Modelo", y="Valor", color="Métrica", barmode="group", title="Comparação de métricas")
             fig.update_layout(height=430)
-            st.plotly_chart(fig, width=stretch)
+            st.plotly_chart(fig, width='stretch')
 
             with st.expander("Ver previsões testadas"):
-                st.dataframe(st.session_state.df_validacao_previsoes, width=stretch, hide_index=True)
+                st.dataframe(st.session_state.df_validacao_previsoes, width='stretch', hide_index=True)
 
 
 # ============================================================
@@ -827,7 +827,7 @@ elif page == "📤 Exportar":
             file_name="relatorio_fifa2026_analytics.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            width=stretch,
+            width='stretch',
         )
 
         with st.expander("Abas incluídas"):
