@@ -649,15 +649,19 @@ elif page == "🎯 Prever partida":
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown("#### 📌 Parâmetros do modelo")
+                df_parametros = pd.DataFrame([
+                    {"Métrica": "Rho Dixon-Coles", "Valor": r["rho_dixon_coles"]},
+                    {"Métrica": "Lambda compartilhado", "Valor": r["lambda_compartilhado"]},
+                    {"Métrica": "Peso estatístico", "Valor": r_ens["peso_estatistico"]},
+                    {"Métrica": "Peso ML", "Valor": r_ens["peso_ml"]},
+                    {"Métrica": "Over 2.5", "Valor": f"{r['prob_over_25']}%"},
+                    {"Métrica": "Ambas marcam", "Valor": f"{r['prob_btts']}%"},
+                ])
+                
+                df_parametros["Valor"] = df_parametros["Valor"].astype(str)
+                
                 st.dataframe(
-                    pd.DataFrame([
-                        {"Métrica": "Rho Dixon-Coles", "Valor": r["rho_dixon_coles"]},
-                        {"Métrica": "Lambda compartilhado", "Valor": r["lambda_compartilhado"]},
-                        {"Métrica": "Peso estatístico", "Valor": r_ens["peso_estatistico"]},
-                        {"Métrica": "Peso ML", "Valor": r_ens["peso_ml"]},
-                        {"Métrica": "Over 2.5", "Valor": f"{r['prob_over_25']}%"},
-                        {"Métrica": "Ambas marcam", "Valor": f"{r['prob_btts']}%"},
-                    ]),
+                    df_parametros,
                     width="stretch",
                     hide_index=True,
                 )
