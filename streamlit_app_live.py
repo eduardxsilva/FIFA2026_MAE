@@ -14,7 +14,7 @@ try:
 except Exception:  # fallback para deploys sem o pacote opcional
     option_menu = None
 
-from fifa2026_core import (
+from fifa2026_core_live import (
     InternetDataExtractor,
     MatchDataLoader,
     DynamicEloModel,
