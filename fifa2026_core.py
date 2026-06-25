@@ -369,7 +369,7 @@ TEAM_ALIASES = {
     "belgica": "Belgium",
     "nova_zelandia": "New Zealand",
     "uruguai": "Uruguay",
-    "cabo_verde": "Cabo Verde",
+    "cabo_verde": "Cape Verde",
     "arabia_saudita": "Saudi Arabia",
     "noruega": "Norway",
     "senegal": "Senegal",
