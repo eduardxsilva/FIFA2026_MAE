@@ -672,7 +672,7 @@ def _canonical_team_local(valor) -> str:
         "belgica": "Belgium", "belgium": "Belgium",
         "nova_zelandia": "New Zealand", "new_zealand": "New Zealand",
         "uruguai": "Uruguay", "uruguay": "Uruguay",
-        "cabo_verde": "Cabo Verde", "cape_verde": "Cabo Verde",
+        "cabo_verde": "Cape Verde", "cape_verde": "Cape Verde",
         "arabia_saudita": "Saudi Arabia", "saudi_arabia": "Saudi Arabia",
         "noruega": "Norway", "norway": "Norway",
         "senegal": "Senegal", "iraque": "Iraq", "iraq": "Iraq",
