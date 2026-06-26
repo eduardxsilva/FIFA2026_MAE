@@ -987,6 +987,9 @@ class BettingOddsExtractor:
         timeout: int = 30,
         provider: str = "odds-api-io",
         limit: int = 100,
+        target_date: Optional[Any] = None,
+        target_timezone: str = "America/Sao_Paulo",
+        team_filter: Optional[List[str]] = None,
     ):
         self.api_key = str(api_key or "").strip()
         self.provider = self._normalizar_provider(provider)
@@ -1001,6 +1004,14 @@ class BettingOddsExtractor:
         self.bookmakers = str(bookmakers or "").strip() or None
         self.timeout = int(timeout or 30)
         self.limit = int(limit or 100)
+        self.target_date = self._normalizar_target_date(target_date)
+        self.target_timezone = str(target_timezone or "America/Sao_Paulo").strip() or "America/Sao_Paulo"
+        self.team_filter = {
+            normalizar_texto(canonical_team_name(x))
+            for x in (team_filter or [])
+            if str(x or "").strip()
+        }
+        self.team_filter.discard("")
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1021,6 +1032,95 @@ class BettingOddsExtractor:
     @staticmethod
     def _split_csv(valor: Any) -> List[str]:
         return [x.strip() for x in str(valor or "").split(",") if x.strip()]
+
+    @staticmethod
+    def _normalizar_target_date(valor: Any) -> Optional[Any]:
+        """Converte uma data escolhida no Streamlit para date. Retorna None se vazio."""
+        if valor in (None, "", "Todas", "todos", "all"):
+            return None
+        try:
+            ts = pd.to_datetime(valor, errors="coerce")
+            if pd.isna(ts):
+                return None
+            return ts.date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _datetime_utc(valor: Any) -> Optional[pd.Timestamp]:
+        """Parser tolerante para datas vindas das APIs de odds."""
+        if valor in (None, ""):
+            return None
+        try:
+            if isinstance(valor, (int, float)) and not pd.isna(valor):
+                # Alguns provedores retornam epoch em segundos ou milissegundos.
+                unit = "ms" if float(valor) > 10_000_000_000 else "s"
+                ts = pd.to_datetime(valor, unit=unit, utc=True, errors="coerce")
+            else:
+                ts = pd.to_datetime(valor, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return None
+            return ts
+        except Exception:
+            return None
+
+    def _data_local_evento(self, valor: Any) -> str:
+        ts = self._datetime_utc(valor)
+        if ts is None:
+            return ""
+        try:
+            return ts.tz_convert(self.target_timezone).date().isoformat()
+        except Exception:
+            return ts.date().isoformat()
+
+    def _datetime_local_evento(self, valor: Any) -> str:
+        ts = self._datetime_utc(valor)
+        if ts is None:
+            return ""
+        try:
+            return ts.tz_convert(self.target_timezone).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ts.strftime("%Y-%m-%d %H:%M")
+
+    def _evento_na_data_alvo(self, valor_data: Any) -> bool:
+        if self.target_date is None:
+            return True
+        data_local = self._data_local_evento(valor_data)
+        if not data_local:
+            return False
+        return data_local == self.target_date.isoformat()
+
+    def _evento_no_filtro_de_equipes(self, home: Any, away: Any) -> bool:
+        if not self.team_filter:
+            return True
+        h = normalizar_texto(canonical_team_name(home))
+        a = normalizar_texto(canonical_team_name(away))
+        # Para evitar odds de clubes, exige que os dois lados sejam seleções reconhecidas.
+        return h in self.team_filter and a in self.team_filter
+
+    @staticmethod
+    def _filtrar_dataframe_por_data(
+        df: pd.DataFrame,
+        target_date: Optional[Any],
+        target_timezone: str = "America/Sao_Paulo",
+    ) -> pd.DataFrame:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        target = BettingOddsExtractor._normalizar_target_date(target_date)
+        if target is None:
+            return df
+        d = df.copy()
+        target_str = target.isoformat()
+        if "Data_Local_Data" in d.columns:
+            return d[d["Data_Local_Data"].astype(str) == target_str].copy()
+        if "Data_UTC" not in d.columns:
+            return d.iloc[0:0].copy()
+        datas = pd.to_datetime(d["Data_UTC"], utc=True, errors="coerce")
+        try:
+            datas_local = datas.dt.tz_convert(target_timezone).dt.date.astype(str)
+        except Exception:
+            datas_local = datas.dt.date.astype(str)
+        return d[datas_local == target_str].copy()
 
     @staticmethod
     def _match_key(time_a: Any, time_b: Any) -> str:
@@ -1147,6 +1247,9 @@ class BettingOddsExtractor:
         event_map: Dict[str, Dict[str, Any]] = {}
         vistos = set()
 
+        pulados_data = 0
+        pulados_equipes = 0
+
         for item in self.sport_keys:
             sport, league = self._parse_sport_league(item)
             params: Dict[str, Any] = {
@@ -1182,6 +1285,12 @@ class BettingOddsExtractor:
                 home, away, date = self._parse_event_home_away(ev)
                 if not home or not away:
                     continue
+                if not self._evento_na_data_alvo(date):
+                    pulados_data += 1
+                    continue
+                if not self._evento_no_filtro_de_equipes(home, away):
+                    pulados_equipes += 1
+                    continue
                 ev2 = dict(ev)
                 ev2["_id"] = event_id
                 ev2["_home"] = home
@@ -1191,6 +1300,11 @@ class BettingOddsExtractor:
                 eventos.append(ev2)
                 event_map[event_id] = ev2
                 vistos.add(event_id)
+
+        if self.target_date is not None:
+            log.append(f"Filtro de data aplicado: {self.target_date.isoformat()} em {self.target_timezone}; eventos ignorados por data={pulados_data}.")
+        if self.team_filter:
+            log.append(f"Filtro de seleções aplicado: {len(self.team_filter)} nome(s) conhecidos; eventos ignorados por equipe={pulados_equipes}.")
 
         return eventos, event_map
 
@@ -1299,6 +1413,9 @@ class BettingOddsExtractor:
         started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         log.append(f"Iniciando consulta de odds em {started}.")
         log.append("Fonte configurada: odds-api.io v3; fluxo /events -> /odds/multi; mercado ML/1X2; odds decimais.")
+        log.append(f"Data-alvo: {self.target_date.isoformat() if self.target_date else 'todas'}; fuso de comparação: {self.target_timezone}.")
+        if self.team_filter:
+            log.append(f"Filtro ativo: somente jogos em que as duas equipes existem na base/modelo ({len(self.team_filter)} seleção(ões)).")
 
         eventos, event_map = self._extrair_eventos_odds_api_io(log)
         if not eventos:
@@ -1364,6 +1481,9 @@ class BettingOddsExtractor:
         started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         log.append(f"Iniciando consulta de odds em {started}.")
         log.append("Fonte configurada: The Odds API v4; mercado h2h/1X2; odds decimais.")
+        log.append(f"Data-alvo: {self.target_date.isoformat() if self.target_date else 'todas'}; fuso de comparação: {self.target_timezone}.")
+        if self.team_filter:
+            log.append(f"Filtro ativo: somente jogos em que as duas equipes existem na base/modelo ({len(self.team_filter)} seleção(ões)).")
 
         for sport_key in self.sport_keys:
             url = f"{self.THE_ODDS_API_BASE_URL}/sports/{sport_key}/odds/"
@@ -1413,6 +1533,11 @@ class BettingOddsExtractor:
             return rows
 
         commence_time = event.get("commence_time", "")
+        if not self._evento_na_data_alvo(commence_time):
+            return rows
+        if not self._evento_no_filtro_de_equipes(home, away):
+            return rows
+
         bookmakers_data = event.get("bookmakers") or []
         for book in bookmakers_data:
             if not isinstance(book, dict):
@@ -1494,6 +1619,8 @@ class BettingOddsExtractor:
             "Sport_Key": sport_key,
             "Event_ID": event_id,
             "Data_UTC": date,
+            "Data_Local": self._datetime_local_evento(date),
+            "Data_Local_Data": self._data_local_evento(date),
             "Mandante": home,
             "Visitante": away,
             "Mandante_Original": home_raw,
@@ -1528,6 +1655,8 @@ class BettingOddsExtractor:
         agg = d.groupby(["Match_Key", "Mandante", "Visitante"], as_index=False).agg(
             Provider=("Provider", lambda x: ", ".join(sorted(set(map(str, x)))[:3]) if "Provider" in d.columns else ""),
             Data_UTC=("Data_UTC", "min"),
+            Data_Local=("Data_Local", "min") if "Data_Local" in d.columns else ("Data_UTC", "min"),
+            Data_Local_Data=("Data_Local_Data", "min") if "Data_Local_Data" in d.columns else ("Data_UTC", "min"),
             Casas_Usadas=("Bookmaker", "nunique"),
             Casas_Lista=("Bookmaker", lambda x: ", ".join(sorted(set(map(str, x)))[:18])),
             Odds_Media_Mandante=("Odds_Mandante", "mean"),
@@ -1563,7 +1692,7 @@ class BettingOddsExtractor:
         agg["Margem_Favorito_Mercado_p.p."] = confs
 
         cols = [
-            "Provider", "Data_UTC", "Mandante", "Visitante", "Casas_Usadas", "Casas_Lista",
+            "Provider", "Data_UTC", "Data_Local", "Data_Local_Data", "Mandante", "Visitante", "Casas_Usadas", "Casas_Lista",
             "Odds_Media_Mandante", "Odds_Media_Empate", "Odds_Media_Visitante",
             "Prob_Mercado_Mandante_pct", "Prob_Mercado_Empate_pct", "Prob_Mercado_Visitante_pct",
             "Favorito_Casas", "Margem_Favorito_Mercado_p.p.", "Overround_Medio", "Atualizado_UTC", "Match_Key",
@@ -1590,6 +1719,8 @@ class BettingOddsExtractor:
         mandante: Any,
         visitante: Any,
         minimo_score: float = 0.84,
+        target_date: Optional[Any] = None,
+        target_timezone: str = "America/Sao_Paulo",
     ) -> Optional[Dict[str, Any]]:
         if consensus is None or not isinstance(consensus, pd.DataFrame) or consensus.empty:
             return None
@@ -1599,7 +1730,9 @@ class BettingOddsExtractor:
         if not home or not away:
             return None
 
-        d = consensus.copy()
+        d = cls._filtrar_dataframe_por_data(consensus.copy(), target_date, target_timezone)
+        if d.empty:
+            return None
         if not {"Mandante", "Visitante"}.issubset(d.columns):
             return None
 

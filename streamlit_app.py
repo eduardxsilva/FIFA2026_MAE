@@ -669,7 +669,28 @@ def split_csv_local(valor: str) -> list[str]:
     return [x.strip() for x in str(valor or "").split(",") if x.strip()]
 
 
-def atualizar_odds_ao_vivo(api_key: str, sport_keys: str, regions: str, bookmakers: str = "", provider: str = "odds-api-io") -> None:
+def obter_equipes_para_filtro_odds() -> list[str]:
+    """Usa seleções da Copa 2026, se disponíveis; senão usa equipes treinadas no modelo."""
+    equipes = []
+    copa = st.session_state.get("equipes_copa_2026", []) or []
+    if copa:
+        equipes.extend([str(x) for x in copa if str(x).strip()])
+    elif isinstance(st.session_state.get("df_team_stats"), pd.DataFrame) and not st.session_state.df_team_stats.empty:
+        if "Equipe" in st.session_state.df_team_stats.columns:
+            equipes.extend(st.session_state.df_team_stats["Equipe"].dropna().astype(str).tolist())
+    return sorted(set([x for x in equipes if x and x.lower() != "nan"]))
+
+
+def atualizar_odds_ao_vivo(
+    api_key: str,
+    sport_keys: str,
+    regions: str,
+    bookmakers: str = "",
+    provider: str = "odds-api-io",
+    data_partidas=None,
+    filtrar_equipes: bool = True,
+) -> None:
+    equipes_filtro = obter_equipes_para_filtro_odds() if filtrar_equipes else []
     extractor = BettingOddsExtractor(
         api_key=api_key,
         sport_keys=split_csv_local(sport_keys),
@@ -677,6 +698,9 @@ def atualizar_odds_ao_vivo(api_key: str, sport_keys: str, regions: str, bookmake
         bookmakers=bookmakers.strip() or None,
         timeout=35,
         provider=provider,
+        target_date=data_partidas,
+        target_timezone="America/Sao_Paulo",
+        team_filter=equipes_filtro,
     )
     result = extractor.extrair_ao_vivo()
     st.session_state.df_odds_raw = result.raw.copy() if isinstance(result.raw, pd.DataFrame) else pd.DataFrame()
@@ -1514,6 +1538,18 @@ elif page == "Importar dados":
                 value="Bet365,Unibet",
                 help="No odds-api.io use nomes como Bet365,Unibet. Se deixar vazio, usa os bookmakers selecionados no dashboard da conta, quando o provedor permitir.",
             )
+            odds_data_partidas = st.date_input(
+                "Data das partidas para varredura",
+                value=datetime.now().date(),
+                help="O app busca eventos dessa data no fuso America/Sao_Paulo e só depois consulta as odds.",
+                key="odds_data_import",
+            )
+            odds_filtrar_selecoes = st.checkbox(
+                "Filtrar apenas seleções reconhecidas no Excel/modelo",
+                value=True,
+                help="Evita trazer odds de clubes quando o sport=football retorna muitos campeonatos.",
+                key="odds_filtrar_selecoes_import",
+            )
 
         if uploaded_unico is not None:
             if st.button("Carregar arquivo único e preparar modelos", type="primary", width="stretch", icon=":material/upload_file:"):
@@ -1560,7 +1596,15 @@ elif page == "Importar dados":
                                 st.warning("Odds não atualizadas: informe ODDS_API_KEY ou digite a API key no campo de configuração.")
                             else:
                                 with st.spinner("Consultando odds em tempo real e calculando consenso das casas..."):
-                                    atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys, odds_regions, odds_bookmakers, odds_provider)
+                                    atualizar_odds_ao_vivo(
+                                        api_key_odds,
+                                        odds_sport_keys,
+                                        odds_regions,
+                                        odds_bookmakers,
+                                        odds_provider,
+                                        data_partidas=odds_data_partidas,
+                                        filtrar_equipes=odds_filtrar_selecoes,
+                                    )
 
                     metricas_tmp = obter_metricas_fifa_equipes_do_estado()
                     jogos_tmp = st.session_state.internet_extras.get("copa2026_jogos_fifa") if isinstance(st.session_state.internet_extras, dict) else None
@@ -1760,6 +1804,17 @@ elif page == "Prever partida":
             with c_od3:
                 st.caption(f"Última atualização: {st.session_state.odds_last_update or 'não atualizada'}")
 
+            odds_data_pred = st.date_input(
+                "Data das partidas para buscar/usar odds",
+                value=datetime.now().date(),
+                help="Filtra odds pela data local America/Sao_Paulo. Use a data do jogo, não a data da previsão.",
+                key="odds_data_prever",
+            )
+            odds_filtrar_selecoes_pred = st.checkbox(
+                "Filtrar odds apenas por seleções do Excel/modelo",
+                value=True,
+                key="odds_filtrar_selecoes_prever",
+            )
             atualizar_agora = st.checkbox("Atualizar odds agora antes da previsão", value=False)
             if atualizar_agora:
                 odds_api_key_pred = st.text_input("API key das odds", value="", type="password", key="odds_api_key_prever")
@@ -1788,10 +1843,22 @@ elif page == "Prever partida":
                             st.warning("Odds não atualizadas: informe ODDS_API_KEY ou digite a API key.")
                         else:
                             with st.spinner("Atualizando odds em tempo real..."):
-                                atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys_pred, odds_regions_pred, odds_bookmakers_pred, odds_provider_pred)
+                                atualizar_odds_ao_vivo(
+                                    api_key_odds,
+                                    odds_sport_keys_pred,
+                                    odds_regions_pred,
+                                    odds_bookmakers_pred,
+                                    odds_provider_pred,
+                                    data_partidas=odds_data_pred,
+                                    filtrar_equipes=odds_filtrar_selecoes_pred,
+                                )
 
                     odds_partida = BettingOddsExtractor.buscar_odds_partida(
-                        st.session_state.df_odds_consenso, mandante, visitante
+                        st.session_state.df_odds_consenso,
+                        mandante,
+                        visitante,
+                        target_date=odds_data_pred if 'odds_data_pred' in locals() else None,
+                        target_timezone="America/Sao_Paulo",
                     ) if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) else None
                     previsao_mercado = combinar_previsao_com_odds(r_ens, odds_partida, peso_odds=peso_odds) if odds_partida else None
 
