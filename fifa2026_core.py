@@ -930,6 +930,426 @@ class InternetDataExtractor:
         out = out.sort_values(["Tipo_Classificacao", "Grupo", "Posicao_Calculada"]).reset_index(drop=True)
         return out
 
+
+# ============================================================
+# ODDS DE CASAS DE APOSTA — CONSENSO DE MERCADO
+# ============================================================
+
+@dataclass
+class OddsExtractionResult:
+    raw: pd.DataFrame
+    consensus: pd.DataFrame
+    log: List[str]
+
+
+class BettingOddsExtractor:
+    """
+    Integra odds 1X2 de futebol por API, sem scraping direto de sites de aposta.
+
+    Padrão implementado: The Odds API v4.
+    - mercado: h2h / 1X2
+    - odds: decimal
+    - saída bruta por casa
+    - consenso médio sem vig por partida
+
+    Observação prática:
+    a disponibilidade de Copa do Mundo 2026 depende do provedor expor o sport_key
+    e de as partidas já estarem abertas nas casas consultadas.
+    """
+
+    BASE_URL = "https://api.the-odds-api.com/v4"
+
+    DEFAULT_SPORT_KEYS = [
+        "soccer_fifa_world_cup",
+        "soccer_international_friendlies",
+        "soccer_conmebol_copa_america",
+        "soccer_uefa_european_championship",
+    ]
+
+    def __init__(
+        self,
+        api_key: str,
+        sport_keys: Optional[List[str]] = None,
+        regions: str = "eu,uk,us,us2,au",
+        markets: str = "h2h",
+        odds_format: str = "decimal",
+        bookmakers: Optional[str] = None,
+        timeout: int = 30,
+    ):
+        self.api_key = str(api_key or "").strip()
+        self.sport_keys = [str(x).strip() for x in (sport_keys or self.DEFAULT_SPORT_KEYS) if str(x).strip()]
+        self.regions = str(regions or "eu,uk,us,us2,au").strip()
+        self.markets = str(markets or "h2h").strip()
+        self.odds_format = str(odds_format or "decimal").strip()
+        self.bookmakers = str(bookmakers or "").strip() or None
+        self.timeout = int(timeout or 30)
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+        }
+
+    @staticmethod
+    def _split_csv(valor: Any) -> List[str]:
+        return [x.strip() for x in str(valor or "").split(",") if x.strip()]
+
+    @staticmethod
+    def _match_key(time_a: Any, time_b: Any) -> str:
+        a = normalizar_texto(canonical_team_name(time_a))
+        b = normalizar_texto(canonical_team_name(time_b))
+        return f"{a}__vs__{b}"
+
+    @staticmethod
+    def _is_draw_name(nome: Any) -> bool:
+        n = normalizar_texto(nome)
+        return n in {"draw", "empate", "tie", "x"}
+
+    def _get_json(self, url: str, params: Dict[str, Any], log: List[str]) -> Any:
+        resp = requests.get(url, params=params, headers=self.headers, timeout=self.timeout)
+        remaining = resp.headers.get("x-requests-remaining")
+        used = resp.headers.get("x-requests-used")
+        if remaining is not None or used is not None:
+            log.append(f"Cota Odds API: usadas={used or 'n/d'} restantes={remaining or 'n/d'}.")
+        resp.raise_for_status()
+        return resp.json()
+
+    def listar_esportes_disponiveis(self) -> pd.DataFrame:
+        """Lista sport_keys disponíveis na conta/API usada."""
+        if not self.api_key:
+            raise ValueError("Informe a API key das odds.")
+        url = f"{self.BASE_URL}/sports"
+        data = self._get_json(url, {"apiKey": self.api_key}, [])
+        if not isinstance(data, list):
+            return pd.DataFrame()
+        return pd.DataFrame(data)
+
+    def extrair_ao_vivo(self) -> OddsExtractionResult:
+        if not self.api_key:
+            raise ValueError("Informe a API key das odds.")
+        if not self.sport_keys:
+            raise ValueError("Informe ao menos um sport_key para consulta de odds.")
+
+        log: List[str] = []
+        rows: List[Dict[str, Any]] = []
+        started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        log.append(f"Iniciando consulta de odds em {started}.")
+        log.append("Fonte configurada: The Odds API v4; mercado h2h/1X2; odds decimais.")
+
+        for sport_key in self.sport_keys:
+            url = f"{self.BASE_URL}/sports/{sport_key}/odds/"
+            params: Dict[str, Any] = {
+                "apiKey": self.api_key,
+                "regions": self.regions,
+                "markets": self.markets,
+                "oddsFormat": self.odds_format,
+                "dateFormat": "iso",
+            }
+            if self.bookmakers:
+                params["bookmakers"] = self.bookmakers
+
+            try:
+                log.append(f"Consultando odds: sport_key={sport_key}; regions={self.regions}; bookmakers={self.bookmakers or 'todos da região'}.")
+                data = self._get_json(url, params, log)
+            except Exception as e:
+                log.append(f"Falha ao consultar {sport_key}: {e}")
+                continue
+
+            if not isinstance(data, list) or not data:
+                log.append(f"{sport_key}: nenhuma partida com odds retornada.")
+                continue
+
+            log.append(f"{sport_key}: {len(data)} partida(s) retornada(s).")
+            for event in data:
+                if not isinstance(event, dict):
+                    continue
+                home_raw = event.get("home_team", "")
+                away_raw = event.get("away_team", "")
+                home = canonical_team_name(home_raw)
+                away = canonical_team_name(away_raw)
+                if not home or not away:
+                    continue
+
+                commence_time = event.get("commence_time", "")
+                bookmakers_data = event.get("bookmakers") or []
+                for book in bookmakers_data:
+                    if not isinstance(book, dict):
+                        continue
+                    book_key = book.get("key", "")
+                    book_title = book.get("title", book_key)
+                    last_update = book.get("last_update", "")
+
+                    odds_home = np.nan
+                    odds_draw = np.nan
+                    odds_away = np.nan
+
+                    for market in book.get("markets") or []:
+                        if not isinstance(market, dict) or market.get("key") != "h2h":
+                            continue
+                        for outcome in market.get("outcomes") or []:
+                            if not isinstance(outcome, dict):
+                                continue
+                            nome_out = outcome.get("name", "")
+                            preco = pd.to_numeric(outcome.get("price"), errors="coerce")
+                            if pd.isna(preco) or float(preco) <= 1.0:
+                                continue
+                            nome_canon = canonical_team_name(nome_out)
+                            if nome_canon == home:
+                                odds_home = float(preco)
+                            elif nome_canon == away:
+                                odds_away = float(preco)
+                            elif self._is_draw_name(nome_out):
+                                odds_draw = float(preco)
+
+                    if pd.isna(odds_home) or pd.isna(odds_away):
+                        continue
+
+                    inv_home = 1.0 / float(odds_home)
+                    inv_draw = 1.0 / float(odds_draw) if not pd.isna(odds_draw) and float(odds_draw) > 1 else 0.0
+                    inv_away = 1.0 / float(odds_away)
+                    overround = inv_home + inv_draw + inv_away
+                    if overround <= 0:
+                        continue
+
+                    rows.append({
+                        "Sport_Key": sport_key,
+                        "Event_ID": event.get("id", ""),
+                        "Data_UTC": commence_time,
+                        "Mandante": home,
+                        "Visitante": away,
+                        "Mandante_Original": home_raw,
+                        "Visitante_Original": away_raw,
+                        "Bookmaker_Key": book_key,
+                        "Bookmaker": book_title,
+                        "Bookmaker_Last_Update": last_update,
+                        "Odds_Mandante": odds_home,
+                        "Odds_Empate": odds_draw,
+                        "Odds_Visitante": odds_away,
+                        "Overround": overround,
+                        "Prob_Bruta_Mandante": inv_home,
+                        "Prob_Bruta_Empate": inv_draw,
+                        "Prob_Bruta_Visitante": inv_away,
+                        "Prob_SemVig_Mandante": inv_home / overround,
+                        "Prob_SemVig_Empate": inv_draw / overround if inv_draw > 0 else 0.0,
+                        "Prob_SemVig_Visitante": inv_away / overround,
+                        "Match_Key": self._match_key(home, away),
+                        "Extraido_UTC": started,
+                    })
+
+        raw = pd.DataFrame(rows)
+        if raw.empty:
+            log.append("Nenhuma odd 1X2 aproveitável foi encontrada.")
+            return OddsExtractionResult(raw=raw, consensus=pd.DataFrame(), log=log)
+
+        consensus = self.consolidar_consenso(raw)
+        log.append(f"Odds brutas: {len(raw)} linha(s). Consenso: {len(consensus)} partida(s).")
+        return OddsExtractionResult(raw=raw, consensus=consensus, log=log)
+
+    @staticmethod
+    def consolidar_consenso(raw: pd.DataFrame) -> pd.DataFrame:
+        if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+            return pd.DataFrame()
+
+        d = raw.copy()
+        required = ["Match_Key", "Mandante", "Visitante", "Bookmaker"]
+        if any(c not in d.columns for c in required):
+            return pd.DataFrame()
+
+        agg = d.groupby(["Match_Key", "Mandante", "Visitante"], as_index=False).agg(
+            Data_UTC=("Data_UTC", "min"),
+            Casas_Usadas=("Bookmaker", "nunique"),
+            Casas_Lista=("Bookmaker", lambda x: ", ".join(sorted(set(map(str, x)))[:18])),
+            Odds_Media_Mandante=("Odds_Mandante", "mean"),
+            Odds_Media_Empate=("Odds_Empate", "mean"),
+            Odds_Media_Visitante=("Odds_Visitante", "mean"),
+            Odds_Min_Mandante=("Odds_Mandante", "min"),
+            Odds_Max_Mandante=("Odds_Mandante", "max"),
+            Odds_Min_Visitante=("Odds_Visitante", "min"),
+            Odds_Max_Visitante=("Odds_Visitante", "max"),
+            Prob_SemVig_Mandante=("Prob_SemVig_Mandante", "mean"),
+            Prob_SemVig_Empate=("Prob_SemVig_Empate", "mean"),
+            Prob_SemVig_Visitante=("Prob_SemVig_Visitante", "mean"),
+            Overround_Medio=("Overround", "mean"),
+            Atualizado_UTC=("Extraido_UTC", "max"),
+        )
+
+        soma = agg[["Prob_SemVig_Mandante", "Prob_SemVig_Empate", "Prob_SemVig_Visitante"]].sum(axis=1).replace(0, np.nan)
+        for col in ["Mandante", "Empate", "Visitante"]:
+            agg[f"Prob_Mercado_{col}_pct"] = (100 * agg[f"Prob_SemVig_{col}"] / soma).round(2)
+
+        favoritos = []
+        confs = []
+        for _, row in agg.iterrows():
+            probs = {
+                str(row["Mandante"]): float(row["Prob_Mercado_Mandante_pct"]),
+                "Empate": float(row["Prob_Mercado_Empate_pct"]),
+                str(row["Visitante"]): float(row["Prob_Mercado_Visitante_pct"]),
+            }
+            ordenado = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+            favoritos.append(ordenado[0][0])
+            confs.append(round(ordenado[0][1] - ordenado[1][1], 2) if len(ordenado) >= 2 else 0.0)
+        agg["Favorito_Casas"] = favoritos
+        agg["Margem_Favorito_Mercado_p.p."] = confs
+
+        cols = [
+            "Data_UTC", "Mandante", "Visitante", "Casas_Usadas", "Casas_Lista",
+            "Odds_Media_Mandante", "Odds_Media_Empate", "Odds_Media_Visitante",
+            "Prob_Mercado_Mandante_pct", "Prob_Mercado_Empate_pct", "Prob_Mercado_Visitante_pct",
+            "Favorito_Casas", "Margem_Favorito_Mercado_p.p.", "Overround_Medio", "Atualizado_UTC", "Match_Key",
+            "Odds_Min_Mandante", "Odds_Max_Mandante", "Odds_Min_Visitante", "Odds_Max_Visitante",
+        ]
+        cols = [c for c in cols if c in agg.columns]
+        return agg[cols].sort_values(["Data_UTC", "Mandante", "Visitante"]).reset_index(drop=True)
+
+    @staticmethod
+    def _similaridade(a: Any, b: Any) -> float:
+        from difflib import SequenceMatcher
+        aa = normalizar_texto(canonical_team_name(a))
+        bb = normalizar_texto(canonical_team_name(b))
+        if not aa or not bb:
+            return 0.0
+        if aa == bb:
+            return 1.0
+        return float(SequenceMatcher(None, aa, bb).ratio())
+
+    @classmethod
+    def buscar_odds_partida(
+        cls,
+        consensus: pd.DataFrame,
+        mandante: Any,
+        visitante: Any,
+        minimo_score: float = 0.84,
+    ) -> Optional[Dict[str, Any]]:
+        if consensus is None or not isinstance(consensus, pd.DataFrame) or consensus.empty:
+            return None
+
+        home = canonical_team_name(mandante)
+        away = canonical_team_name(visitante)
+        if not home or not away:
+            return None
+
+        d = consensus.copy()
+        if not {"Mandante", "Visitante"}.issubset(d.columns):
+            return None
+
+        home_key = normalizar_texto(home)
+        away_key = normalizar_texto(away)
+        d["_home_key"] = d["Mandante"].apply(lambda x: normalizar_texto(canonical_team_name(x)))
+        d["_away_key"] = d["Visitante"].apply(lambda x: normalizar_texto(canonical_team_name(x)))
+
+        exact = d[(d["_home_key"] == home_key) & (d["_away_key"] == away_key)]
+        if not exact.empty:
+            row = exact.iloc[0].to_dict()
+            row["Orientacao_Modelo"] = "mesma"
+            return row
+
+        reversed_match = d[(d["_home_key"] == away_key) & (d["_away_key"] == home_key)]
+        if not reversed_match.empty:
+            row = reversed_match.iloc[0].to_dict()
+            return cls._inverter_orientacao(row, home, away)
+
+        best = None
+        best_score = 0.0
+        best_reverse = False
+        for _, row in d.iterrows():
+            score_direct = 0.5 * cls._similaridade(home, row["Mandante"]) + 0.5 * cls._similaridade(away, row["Visitante"])
+            score_reverse = 0.5 * cls._similaridade(home, row["Visitante"]) + 0.5 * cls._similaridade(away, row["Mandante"])
+            if score_direct > best_score:
+                best = row.to_dict()
+                best_score = score_direct
+                best_reverse = False
+            if score_reverse > best_score:
+                best = row.to_dict()
+                best_score = score_reverse
+                best_reverse = True
+
+        if best is None or best_score < minimo_score:
+            return None
+        if best_reverse:
+            best = cls._inverter_orientacao(best, home, away)
+        else:
+            best["Orientacao_Modelo"] = "aproximada"
+        best["Score_Match_Odds"] = round(best_score, 3)
+        return best
+
+    @staticmethod
+    def _inverter_orientacao(row: Dict[str, Any], home_modelo: str, away_modelo: str) -> Dict[str, Any]:
+        out = dict(row)
+        out["Mandante_Original_Odds"] = row.get("Mandante")
+        out["Visitante_Original_Odds"] = row.get("Visitante")
+        out["Mandante"] = home_modelo
+        out["Visitante"] = away_modelo
+
+        swaps = [
+            ("Odds_Media_Mandante", "Odds_Media_Visitante"),
+            ("Prob_Mercado_Mandante_pct", "Prob_Mercado_Visitante_pct"),
+            ("Odds_Min_Mandante", "Odds_Min_Visitante"),
+            ("Odds_Max_Mandante", "Odds_Max_Visitante"),
+        ]
+        for a, b in swaps:
+            if a in out and b in out:
+                out[a], out[b] = out[b], out[a]
+
+        probs = {
+            home_modelo: float(out.get("Prob_Mercado_Mandante_pct", 0) or 0),
+            "Empate": float(out.get("Prob_Mercado_Empate_pct", 0) or 0),
+            away_modelo: float(out.get("Prob_Mercado_Visitante_pct", 0) or 0),
+        }
+        out["Favorito_Casas"] = max(probs, key=probs.get)
+        out["Orientacao_Modelo"] = "invertida"
+        return out
+
+
+def combinar_previsao_com_odds(previsao_ensemble: Dict[str, Any], odds_partida: Optional[Dict[str, Any]], peso_odds: float = 0.35) -> Optional[Dict[str, Any]]:
+    """
+    Combina previsão estatística/ML com probabilidade implícita de mercado.
+    Retorna None se não houver odds disponíveis.
+    """
+    if not previsao_ensemble or not odds_partida:
+        return None
+
+    peso_odds = clamp(float(peso_odds), 0.0, 1.0)
+    peso_modelo = 1.0 - peso_odds
+
+    p_model_home = float(previsao_ensemble.get("ensemble_prob_mandante", 0) or 0)
+    p_model_draw = float(previsao_ensemble.get("ensemble_prob_empate", 0) or 0)
+    p_model_away = float(previsao_ensemble.get("ensemble_prob_visitante", 0) or 0)
+
+    p_market_home = float(odds_partida.get("Prob_Mercado_Mandante_pct", 0) or 0)
+    p_market_draw = float(odds_partida.get("Prob_Mercado_Empate_pct", 0) or 0)
+    p_market_away = float(odds_partida.get("Prob_Mercado_Visitante_pct", 0) or 0)
+
+    p_home = peso_modelo * p_model_home + peso_odds * p_market_home
+    p_draw = peso_modelo * p_model_draw + peso_odds * p_market_draw
+    p_away = peso_modelo * p_model_away + peso_odds * p_market_away
+
+    soma = p_home + p_draw + p_away
+    if soma > 0:
+        p_home, p_draw, p_away = 100 * p_home / soma, 100 * p_draw / soma, 100 * p_away / soma
+
+    mandante = str(previsao_ensemble.get("mandante", odds_partida.get("Mandante", "Mandante")))
+    visitante = str(previsao_ensemble.get("visitante", odds_partida.get("Visitante", "Visitante")))
+    probs = {mandante: p_home, "Empate": p_draw, visitante: p_away}
+    ordenado = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+
+    return {
+        "mandante": mandante,
+        "visitante": visitante,
+        "peso_modelo": round(peso_modelo, 2),
+        "peso_odds": round(peso_odds, 2),
+        "prob_final_mandante": round(p_home, 2),
+        "prob_final_empate": round(p_draw, 2),
+        "prob_final_visitante": round(p_away, 2),
+        "favorito_modelo_mercado": ordenado[0][0],
+        "margem_favorito_final_p.p.": round(ordenado[0][1] - ordenado[1][1], 2) if len(ordenado) >= 2 else 0.0,
+        "favorito_casas": odds_partida.get("Favorito_Casas", ""),
+        "casas_usadas": odds_partida.get("Casas_Usadas", 0),
+        "placar_provavel_modelo": previsao_ensemble.get("placar_provavel", ""),
+    }
+
 # ============================================================
 # 1. LEITOR E VALIDADOR DE BASE
 # ============================================================

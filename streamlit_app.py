@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from datetime import datetime, timezone
@@ -26,6 +27,8 @@ from fifa2026_core import (
     MonteCarloChampionSimulator,
     WorldCupFormatSimulator,
     ModelBacktester,
+    BettingOddsExtractor,
+    combinar_previsao_com_odds,
 )
 
 
@@ -513,6 +516,12 @@ def init_state() -> None:
         "df_validacao_previsoes": None,
         "fonte_base": None,
         "fifa_live_last_update": None,
+        "df_odds_raw": None,
+        "df_odds_consenso": None,
+        "odds_log": [],
+        "odds_last_update": None,
+        "ultima_odds_partida": None,
+        "ultima_previsao_modelo_mercado": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -603,6 +612,88 @@ def sync_copa_live_state_from_extras(extras: dict) -> None:
 
     st.session_state.equipes_copa_2026 = sorted([e for e in equipes if e and e.lower() != "nan"])
 
+
+
+
+def _buscar_sheet_extra(extras: dict, termos: list[str]) -> pd.DataFrame:
+    if not isinstance(extras, dict):
+        return pd.DataFrame()
+    termos_norm = [_normalizar_coluna_local(t) for t in termos]
+    for key, df in extras.items():
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        k = _normalizar_coluna_local(key)
+        if all(t in k for t in termos_norm):
+            return df.copy()
+    for key, df in extras.items():
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        k = _normalizar_coluna_local(key)
+        if any(t in k for t in termos_norm):
+            return df.copy()
+    return pd.DataFrame()
+
+
+def sync_odds_state_from_extras(extras: dict) -> None:
+    """Carrega odds já salvas no Excel, quando existirem."""
+    consenso = _buscar_sheet_extra(extras, ["odds", "consenso"])
+    bruto = _buscar_sheet_extra(extras, ["odds", "bruto"])
+    log_df = _buscar_sheet_extra(extras, ["odds", "log"])
+
+    if isinstance(consenso, pd.DataFrame) and not consenso.empty:
+        st.session_state.df_odds_consenso = consenso
+        if "Atualizado_UTC" in consenso.columns:
+            st.session_state.odds_last_update = str(consenso["Atualizado_UTC"].dropna().astype(str).max())
+    if isinstance(bruto, pd.DataFrame) and not bruto.empty:
+        st.session_state.df_odds_raw = bruto
+    if isinstance(log_df, pd.DataFrame) and not log_df.empty:
+        col = log_df.columns[0]
+        st.session_state.odds_log = log_df[col].astype(str).tolist()
+
+
+def obter_odds_api_key(valor_digitado: str = "") -> str:
+    """Prioridade: campo digitado > secrets.toml > variável de ambiente."""
+    valor_digitado = str(valor_digitado or "").strip()
+    if valor_digitado:
+        return valor_digitado
+    try:
+        secret = st.secrets.get("ODDS_API_KEY", "")
+        if secret:
+            return str(secret).strip()
+    except Exception:
+        pass
+    return str(os.environ.get("ODDS_API_KEY", "")).strip()
+
+
+def split_csv_local(valor: str) -> list[str]:
+    return [x.strip() for x in str(valor or "").split(",") if x.strip()]
+
+
+def atualizar_odds_ao_vivo(api_key: str, sport_keys: str, regions: str, bookmakers: str = "") -> None:
+    extractor = BettingOddsExtractor(
+        api_key=api_key,
+        sport_keys=split_csv_local(sport_keys),
+        regions=regions,
+        bookmakers=bookmakers.strip() or None,
+        timeout=35,
+    )
+    result = extractor.extrair_ao_vivo()
+    st.session_state.df_odds_raw = result.raw.copy() if isinstance(result.raw, pd.DataFrame) else pd.DataFrame()
+    st.session_state.df_odds_consenso = result.consensus.copy() if isinstance(result.consensus, pd.DataFrame) else pd.DataFrame()
+    st.session_state.odds_log = result.log
+    if isinstance(result.consensus, pd.DataFrame) and not result.consensus.empty and "Atualizado_UTC" in result.consensus.columns:
+        st.session_state.odds_last_update = str(result.consensus["Atualizado_UTC"].dropna().astype(str).max())
+    else:
+        st.session_state.odds_last_update = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Também guarda como extras para exportação posterior.
+    if not isinstance(st.session_state.internet_extras, dict):
+        st.session_state.internet_extras = {}
+    if isinstance(st.session_state.df_odds_raw, pd.DataFrame) and not st.session_state.df_odds_raw.empty:
+        st.session_state.internet_extras["odds_mercado_bruto"] = st.session_state.df_odds_raw
+    if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) and not st.session_state.df_odds_consenso.empty:
+        st.session_state.internet_extras["odds_consenso_partidas"] = st.session_state.df_odds_consenso
+    st.session_state.internet_extras["odds_log"] = pd.DataFrame({"log": result.log})
 
 
 
@@ -1120,6 +1211,8 @@ def reset_models() -> None:
         "ultima_previsao",
         "ultima_previsao_ml",
         "ultima_previsao_ensemble",
+        "ultima_odds_partida",
+        "ultima_previsao_modelo_mercado",
         "df_simulacao_campeao",
         "df_simulacao_copa",
         "ultima_copa_simulada",
@@ -1385,6 +1478,36 @@ elif page == "Importar dados":
             help="Quando marcado, o app carrega o Excel, sincroniza a Copa 2026, incorpora as métricas FIFA e treina Elo, Poisson, ML e Ensemble no mesmo clique.",
         )
 
+        st.divider()
+        st.markdown("**Marcador de odds das casas de aposta — opcional**")
+        ativar_odds_import = st.checkbox(
+            "Buscar odds em tempo real durante este import",
+            value=False,
+            help="Consulta uma API de odds e salva as médias por partida no estado do app e na exportação. Não usa scraping direto de sites de aposta.",
+        )
+        with st.expander("Configurar API de odds"):
+            odds_api_key_input = st.text_input(
+                "API key das odds",
+                value="",
+                type="password",
+                help="Pode deixar vazio se você configurou ODDS_API_KEY no secrets.toml ou nas variáveis de ambiente.",
+            )
+            odds_sport_keys = st.text_input(
+                "Sport keys",
+                value="soccer_fifa_world_cup,soccer_international_friendlies",
+                help="Use as chaves do provedor. Para Copa, tente soccer_fifa_world_cup; a disponibilidade depende do provedor e da data das partidas.",
+            )
+            odds_regions = st.text_input(
+                "Regiões",
+                value="eu,uk,us,us2,au",
+                help="Regiões aceitas pelo provedor de odds. Mais regiões consomem mais cota.",
+            )
+            odds_bookmakers = st.text_input(
+                "Bookmakers específicos, opcional",
+                value="",
+                help="Exemplo: bet365,betfair,williamhill. Vazio = todos disponíveis nas regiões.",
+            )
+
         if uploaded_unico is not None:
             if st.button("Carregar arquivo único e preparar modelos", type="primary", width="stretch", icon=":material/upload_file:"):
                 suffix = Path(uploaded_unico.name).suffix.lower()
@@ -1415,6 +1538,7 @@ elif page == "Importar dados":
 
                         if extras_local:
                             sync_copa_live_state_from_extras(extras_local)
+                            sync_odds_state_from_extras(extras_local)
                         else:
                             st.session_state.equipes_copa_2026 = []
                             st.session_state.df_copa2026_classificacao = None
@@ -1423,12 +1547,20 @@ elif page == "Importar dados":
 
                         reset_models()
 
+                        if ativar_odds_import:
+                            api_key_odds = obter_odds_api_key(odds_api_key_input)
+                            if not api_key_odds:
+                                st.warning("Odds não atualizadas: informe ODDS_API_KEY ou digite a API key no campo de configuração.")
+                            else:
+                                with st.spinner("Consultando odds em tempo real e calculando consenso das casas..."):
+                                    atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys, odds_regions, odds_bookmakers)
+
                     metricas_tmp = obter_metricas_fifa_equipes_do_estado()
                     jogos_tmp = st.session_state.internet_extras.get("copa2026_jogos_fifa") if isinstance(st.session_state.internet_extras, dict) else None
 
                     st.success("Arquivo único carregado com sucesso.")
 
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     with c1:
                         metric_card("calendar", "Partidas para treino", f"{len(st.session_state.df_matches):,}".replace(",", "."), "base histórica")
                     with c2:
@@ -1439,6 +1571,9 @@ elif page == "Importar dados":
                     with c4:
                         qtd_metricas = len(metricas_tmp) if isinstance(metricas_tmp, pd.DataFrame) and not metricas_tmp.empty else 0
                         metric_card("gauge", "Métricas FIFA", str(qtd_metricas), "linhas detectadas")
+                    with c5:
+                        qtd_odds = len(st.session_state.df_odds_consenso) if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) and not st.session_state.df_odds_consenso.empty else 0
+                        metric_card("line-chart", "Odds mercado", str(qtd_odds), "partidas com consenso")
 
                     if isinstance(metricas_tmp, pd.DataFrame) and not metricas_tmp.empty:
                         st.info("Métricas FIFA detectadas. Elas serão incorporadas ao Poisson, ML e força de campeão.")
@@ -1456,6 +1591,10 @@ elif page == "Importar dados":
                     if isinstance(jogos_tmp, pd.DataFrame) and not jogos_tmp.empty:
                         with st.expander("Ver jogos FIFA importados"):
                             st.dataframe(jogos_tmp, width="stretch", hide_index=True)
+
+                    if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) and not st.session_state.df_odds_consenso.empty:
+                        with st.expander("Ver odds médias das casas"):
+                            st.dataframe(st.session_state.df_odds_consenso, width="stretch", hide_index=True)
 
                     with st.expander("Prévia da base histórica usada no treino"):
                         st.dataframe(st.session_state.df_matches.head(40), width="stretch", hide_index=True)
@@ -1512,6 +1651,7 @@ elif page == "Importar dados":
                 st.session_state.internet_log = result.log
                 st.session_state.fonte_base = "internet"
                 sync_copa_live_state_from_extras(result.extras)
+                sync_odds_state_from_extras(result.extras)
                 reset_models()
 
                 st.success("Base histórica extraída. Treine os modelos novamente antes de prever ou simular.")
@@ -1603,6 +1743,23 @@ elif page == "Prever partida":
         with c3:
             competicao = st.text_input("Competição", value="FIFA World Cup 2026" if usar_copa else "Não informado")
 
+        with st.expander("Odds das casas de aposta"):
+            st.caption("As odds são usadas como leitura de mercado. O placar provável continua vindo do modelo estatístico.")
+            c_od1, c_od2, c_od3 = st.columns([1, 1, 1])
+            with c_od1:
+                peso_odds = st.slider("Peso das odds na combinação final", 0.0, 0.8, 0.35, 0.05)
+            with c_od2:
+                st.metric("Partidas com odds", len(st.session_state.df_odds_consenso) if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) and not st.session_state.df_odds_consenso.empty else 0)
+            with c_od3:
+                st.caption(f"Última atualização: {st.session_state.odds_last_update or 'não atualizada'}")
+
+            atualizar_agora = st.checkbox("Atualizar odds agora antes da previsão", value=False)
+            if atualizar_agora:
+                odds_api_key_pred = st.text_input("API key das odds", value="", type="password", key="odds_api_key_prever")
+                odds_sport_keys_pred = st.text_input("Sport keys", value="soccer_fifa_world_cup,soccer_international_friendlies", key="odds_sport_keys_prever")
+                odds_regions_pred = st.text_input("Regiões", value="eu,uk,us,us2,au", key="odds_regions_prever")
+                odds_bookmakers_pred = st.text_input("Bookmakers específicos, opcional", value="", key="odds_books_prever")
+
         if st.button("Calcular previsão", type="primary", width="stretch", icon=":material/bolt:"):
             if mandante == visitante:
                 st.error("Escolha equipes diferentes.")
@@ -1617,9 +1774,24 @@ elif page == "Prever partida":
                             r_ml = None
                     r_ens = st.session_state.ensemble_model.combinar(r, r_ml)
 
+                    if 'atualizar_agora' in locals() and atualizar_agora:
+                        api_key_odds = obter_odds_api_key(odds_api_key_pred)
+                        if not api_key_odds:
+                            st.warning("Odds não atualizadas: informe ODDS_API_KEY ou digite a API key.")
+                        else:
+                            with st.spinner("Atualizando odds em tempo real..."):
+                                atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys_pred, odds_regions_pred, odds_bookmakers_pred)
+
+                    odds_partida = BettingOddsExtractor.buscar_odds_partida(
+                        st.session_state.df_odds_consenso, mandante, visitante
+                    ) if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) else None
+                    previsao_mercado = combinar_previsao_com_odds(r_ens, odds_partida, peso_odds=peso_odds) if odds_partida else None
+
                     st.session_state.ultima_previsao = r
                     st.session_state.ultima_previsao_ml = r_ml
                     st.session_state.ultima_previsao_ensemble = r_ens
+                    st.session_state.ultima_odds_partida = odds_partida
+                    st.session_state.ultima_previsao_modelo_mercado = previsao_mercado
                     st.success("Previsão calculada.")
                 except Exception as e:
                     st.error(f"Erro na previsão: {e}")
@@ -1627,6 +1799,8 @@ elif page == "Prever partida":
         r = st.session_state.ultima_previsao
         r_ml = st.session_state.ultima_previsao_ml
         r_ens = st.session_state.ultima_previsao_ensemble
+        odds_partida = st.session_state.ultima_odds_partida
+        previsao_mercado = st.session_state.ultima_previsao_modelo_mercado
 
         if r and r_ens:
             c1, c2, c3, c4 = st.columns(4)
@@ -1639,6 +1813,27 @@ elif page == "Prever partida":
             with c4:
                 metric_card("target", "Placar provável", r_ens["placar_provavel"], f"Confiança: {r_ens['confianca']}")
 
+            if odds_partida:
+                c_od1, c_od2, c_od3, c_od4 = st.columns(4)
+                with c_od1:
+                    metric_card("line-chart", "Favorito casas", str(odds_partida.get("Favorito_Casas", "n/d")), f"{odds_partida.get('Casas_Usadas', 0)} casa(s)")
+                with c_od2:
+                    metric_card("home", f"Mercado {r_ens['mandante']}", f"{odds_partida.get('Prob_Mercado_Mandante_pct', 0)}%", f"odd média {round(float(odds_partida.get('Odds_Media_Mandante', 0) or 0), 2)}")
+                with c_od3:
+                    metric_card("layers", "Mercado empate", f"{odds_partida.get('Prob_Mercado_Empate_pct', 0)}%", f"odd média {round(float(odds_partida.get('Odds_Media_Empate', 0) or 0), 2)}")
+                with c_od4:
+                    metric_card("arrow-up-right", f"Mercado {r_ens['visitante']}", f"{odds_partida.get('Prob_Mercado_Visitante_pct', 0)}%", f"odd média {round(float(odds_partida.get('Odds_Media_Visitante', 0) or 0), 2)}")
+
+                if previsao_mercado:
+                    st.info(
+                        f"**Favorito combinado modelo + mercado:** {previsao_mercado['favorito_modelo_mercado']} "
+                        f"| Modelo: {round(100 * previsao_mercado['peso_modelo'])}% "
+                        f"| Odds: {round(100 * previsao_mercado['peso_odds'])}% "
+                        f"| Placar provável estatístico: {previsao_mercado['placar_provavel_modelo']}"
+                    )
+            else:
+                st.warning("Nenhuma odd correspondente foi encontrada para esta partida. A previsão abaixo usa apenas o modelo estatístico/ML.")
+
             prob_df = pd.DataFrame({
                 "Resultado": [f"Vitória {r_ens['mandante']}", "Empate", f"Vitória {r_ens['visitante']}"],
                 "Probabilidade": [r_ens["ensemble_prob_mandante"], r_ens["ensemble_prob_empate"], r_ens["ensemble_prob_visitante"]],
@@ -1647,6 +1842,23 @@ elif page == "Prever partida":
                 "Equipe": [r["mandante"], r["visitante"]],
                 "xG esperado": [r["lambda_mandante"], r["lambda_visitante"]],
             })
+            if odds_partida:
+                mercado_df = pd.DataFrame({
+                    "Resultado": [f"Vitória {r_ens['mandante']}", "Empate", f"Vitória {r_ens['visitante']}"],
+                    "Probabilidade mercado": [
+                        odds_partida.get("Prob_Mercado_Mandante_pct", 0),
+                        odds_partida.get("Prob_Mercado_Empate_pct", 0),
+                        odds_partida.get("Prob_Mercado_Visitante_pct", 0),
+                    ],
+                    "Probabilidade modelo": [
+                        r_ens["ensemble_prob_mandante"],
+                        r_ens["ensemble_prob_empate"],
+                        r_ens["ensemble_prob_visitante"],
+                    ],
+                })
+                with st.expander("Comparativo modelo x casas"):
+                    st.dataframe(mercado_df, width="stretch", hide_index=True)
+                    st.dataframe(pd.DataFrame([odds_partida]), width="stretch", hide_index=True)
 
             c1, c2 = st.columns(2)
             with c1:
@@ -1668,6 +1880,8 @@ elif page == "Prever partida":
                     {"Métrica": "Peso ML", "Valor": r_ens["peso_ml"]},
                     {"Métrica": "Over 2.5", "Valor": f"{r['prob_over_25']}%"},
                     {"Métrica": "Ambas marcam", "Valor": f"{r['prob_btts']}%"},
+                    {"Métrica": "Favorito casas", "Valor": odds_partida.get("Favorito_Casas", "sem odds") if odds_partida else "sem odds"},
+                    {"Métrica": "Favorito combinado", "Valor": previsao_mercado.get("favorito_modelo_mercado", "sem odds") if previsao_mercado else "sem odds"},
                 ])
                 df_parametros["Valor"] = df_parametros["Valor"].astype(str)
                 st.dataframe(df_parametros, width="stretch", hide_index=True)
@@ -1825,6 +2039,14 @@ elif page == "Exportar":
         sheets["validacao_resumo"] = st.session_state.df_validacao_resumo
     if st.session_state.df_validacao_previsoes is not None:
         sheets["validacao_previsoes"] = st.session_state.df_validacao_previsoes
+    if isinstance(st.session_state.df_odds_consenso, pd.DataFrame) and not st.session_state.df_odds_consenso.empty:
+        sheets["odds_consenso_partidas"] = st.session_state.df_odds_consenso
+    if isinstance(st.session_state.df_odds_raw, pd.DataFrame) and not st.session_state.df_odds_raw.empty:
+        sheets["odds_mercado_bruto"] = st.session_state.df_odds_raw
+    if st.session_state.ultima_odds_partida is not None:
+        sheets["ultima_odds_partida"] = pd.DataFrame([st.session_state.ultima_odds_partida])
+    if st.session_state.ultima_previsao_modelo_mercado is not None:
+        sheets["ultima_prev_modelo_mercado"] = pd.DataFrame([st.session_state.ultima_previsao_modelo_mercado])
 
     for name, df_extra in (st.session_state.internet_extras or {}).items():
         if isinstance(df_extra, pd.DataFrame) and not df_extra.empty:
