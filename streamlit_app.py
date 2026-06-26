@@ -720,6 +720,12 @@ def atualizar_odds_ao_vivo(
         st.session_state.internet_extras["odds_consenso_partidas"] = st.session_state.df_odds_consenso
     st.session_state.internet_extras["odds_log"] = pd.DataFrame({"log": result.log})
 
+    if not isinstance(st.session_state.df_odds_consenso, pd.DataFrame) or st.session_state.df_odds_consenso.empty:
+        st.warning(
+            "Odds não encontradas para os filtros atuais. Confira a data, league/sport key, bookmakers e o filtro de seleções."
+        )
+        with st.expander("Ver log técnico da consulta de odds"):
+            st.code("\n".join(result.log[-80:]) if result.log else "Sem log retornado.")
 
 
 def _normalizar_coluna_local(valor) -> str:
@@ -1525,8 +1531,8 @@ elif page == "Importar dados":
             )
             odds_sport_keys = st.text_input(
                 "Esportes / sport keys",
-                value="football",
-                help="Para odds-api.io use football. Também aceita football:league. Para the-odds-api use soccer_fifa_world_cup,soccer_international_friendlies.",
+                value="football:international-fifa-world-cup",
+                help="Para odds-api.io use football:international-fifa-world-cup. Também aceita football ou football:league. Para the-odds-api use soccer_fifa_world_cup,soccer_international_friendlies.",
             )
             odds_regions = st.text_input(
                 "Regiões",
@@ -1819,9 +1825,13 @@ elif page == "Prever partida":
             if atualizar_agora:
                 odds_api_key_pred = st.text_input("API key das odds", value="", type="password", key="odds_api_key_prever")
                 odds_provider_pred = st.selectbox("Provedor", ["odds-api-io", "the-odds-api"], index=0, key="odds_provider_prever")
-                odds_sport_keys_pred = st.text_input("Esportes / sport keys", value="football", key="odds_sport_keys_prever")
+                odds_sport_keys_pred = st.text_input("Esportes / sport keys", value="football:international-fifa-world-cup", key="odds_sport_keys_prever")
                 odds_regions_pred = st.text_input("Regiões", value="", key="odds_regions_prever")
                 odds_bookmakers_pred = st.text_input("Bookmakers específicos, opcional", value="Bet365,Unibet", key="odds_books_prever")
+
+            if st.session_state.odds_log:
+                with st.expander("Último log técnico de odds"):
+                    st.code("\n".join(st.session_state.odds_log[-80:]))
 
         if st.button("Calcular previsão", type="primary", width="stretch", icon=":material/bolt:"):
             if mandante == visitante:

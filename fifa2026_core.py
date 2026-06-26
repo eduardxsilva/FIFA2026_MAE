@@ -967,7 +967,7 @@ class BettingOddsExtractor:
     ODDS_API_IO_BASE_URL = "https://api.odds-api.io/v3"
     THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
 
-    DEFAULT_ODDS_API_IO_SPORTS = ["football"]
+    DEFAULT_ODDS_API_IO_SPORTS = ["football:international-fifa-world-cup"]
 
     DEFAULT_THE_ODDS_API_SPORT_KEYS = [
         "soccer_fifa_world_cup",
@@ -1195,8 +1195,11 @@ class BettingOddsExtractor:
         """
         Permite formatos:
         - football
-        - football:world-cup
-        - football|world-cup
+        - football:international-fifa-world-cup
+        - football|international-fifa-world-cup
+
+        Para Copa do Mundo, use preferencialmente:
+        football:international-fifa-world-cup
         """
         s = str(item or "").strip()
         for sep in [":", "|", "/"]:
@@ -1204,6 +1207,123 @@ class BettingOddsExtractor:
                 a, b = s.split(sep, 1)
                 return a.strip() or "football", b.strip() or None
         return s or "football", None
+
+    def _janela_data_alvo_utc(self) -> Dict[str, str]:
+        """
+        Retorna janela UTC RFC3339 correspondente ao dia escolhido no fuso local.
+        Ex.: 2026-06-13 em America/Sao_Paulo vira 2026-06-13T03:00:00Z até 2026-06-14T02:59:59Z.
+        """
+        if self.target_date is None:
+            return {}
+        try:
+            start_local = pd.Timestamp(self.target_date).tz_localize(self.target_timezone)
+        except TypeError:
+            start_local = pd.Timestamp(self.target_date).tz_convert(self.target_timezone)
+        except Exception:
+            start_local = pd.Timestamp(str(self.target_date)).tz_localize(self.target_timezone)
+        end_local = start_local + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        return {
+            "from": start_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": end_local.tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    def _bookmakers_para_requisicao(self, log: Optional[List[str]] = None) -> str:
+        """
+        odds-api.io exige bookmakers em /odds e /odds/multi.
+        Se o usuário deixou vazio, tenta os bookmakers selecionados na conta; se não vier nada, usa fallback comum.
+        """
+        if self.bookmakers:
+            return self.bookmakers
+        try:
+            selected = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/bookmakers/selected", {"apiKey": self.api_key}, log or [])
+            nomes: List[str] = []
+            if isinstance(selected, dict):
+                for key in ["bookmakers", "selected", "data", "items", "results"]:
+                    val = selected.get(key)
+                    if isinstance(val, list):
+                        for item in val:
+                            if isinstance(item, dict):
+                                nome = item.get("name") or item.get("title") or item.get("key") or item.get("bookmaker")
+                            else:
+                                nome = item
+                            if nome:
+                                nomes.append(str(nome))
+                if not nomes:
+                    for k, v in selected.items():
+                        if isinstance(v, bool) and v:
+                            nomes.append(str(k))
+                        elif isinstance(v, str) and v.strip():
+                            nomes.append(v.strip())
+            elif isinstance(selected, list):
+                for item in selected:
+                    if isinstance(item, dict):
+                        nome = item.get("name") or item.get("title") or item.get("key") or item.get("bookmaker")
+                    else:
+                        nome = item
+                    if nome:
+                        nomes.append(str(nome))
+            nomes = sorted(set([n.strip() for n in nomes if n and str(n).strip()]))
+            if nomes:
+                out = ",".join(nomes[:30])
+                if log is not None:
+                    log.append(f"Bookmakers obtidos da conta odds-api.io: {out}.")
+                return out
+        except Exception as e:
+            if log is not None:
+                log.append(f"Não consegui ler bookmakers selecionados na odds-api.io: {e}")
+        fallback = "Bet365,Unibet"
+        if log is not None:
+            log.append(f"Bookmakers não informados; usando fallback: {fallback}.")
+        return fallback
+
+    def _eventos_search_por_times_odds_api_io(self, log: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fallback: quando /events por liga não retorna nada, procura eventos por nome das seleções.
+        Isso ajuda quando a API cadastrou o jogo em outra liga/slug.
+        """
+        if not self.team_filter or self.target_date is None:
+            return []
+        encontrados: List[Dict[str, Any]] = []
+        vistos = set()
+        # Usa nomes canônicos aproximados vindos do filtro.
+        termos = sorted(self.team_filter)[:80]
+        log.append("Fallback ativo: buscando eventos por nome das seleções em /events/search.")
+        for termo in termos:
+            try:
+                params = {"apiKey": self.api_key, "query": termo.replace("_", " ")}
+                data = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/events/search", params, log)
+                if isinstance(data, dict):
+                    for key in ["data", "events", "items", "results"]:
+                        if isinstance(data.get(key), list):
+                            data = data[key]
+                            break
+                if not isinstance(data, list):
+                    continue
+                for ev in data:
+                    if not isinstance(ev, dict):
+                        continue
+                    event_id = self._extract_event_id(ev)
+                    if not event_id or event_id in vistos:
+                        continue
+                    home, away, date = self._parse_event_home_away(ev)
+                    if not home or not away:
+                        continue
+                    if not self._evento_na_data_alvo(date):
+                        continue
+                    if not self._evento_no_filtro_de_equipes(home, away):
+                        continue
+                    ev2 = dict(ev)
+                    ev2["_id"] = event_id
+                    ev2["_home"] = home
+                    ev2["_away"] = away
+                    ev2["_date"] = date
+                    ev2["_sport_item"] = "events/search"
+                    encontrados.append(ev2)
+                    vistos.add(event_id)
+            except Exception as e:
+                log.append(f"Falha no /events/search para {termo}: {e}")
+        log.append(f"Fallback /events/search encontrou {len(encontrados)} evento(s) aproveitável(is).")
+        return encontrados
 
     def _extract_event_id(self, event: Dict[str, Any]) -> str:
         for key in ["id", "eventId", "event_id", "fixtureId", "fixture_id", "gameId", "game_id"]:
@@ -1249,18 +1369,39 @@ class BettingOddsExtractor:
 
         pulados_data = 0
         pulados_equipes = 0
+        amostras_puladas: List[str] = []
+
+        janela = self._janela_data_alvo_utc()
+        if janela:
+            log.append(f"Janela de busca enviada à API: from={janela['from']}; to={janela['to']}.")
+
+        bookmaker_param = None
+        if self.bookmakers:
+            # /events usa singular bookmaker para filtrar disponibilidade; usa o primeiro como filtro leve.
+            bookmaker_param = self._split_csv(self.bookmakers)[0] if self._split_csv(self.bookmakers) else None
 
         for item in self.sport_keys:
             sport, league = self._parse_sport_league(item)
             params: Dict[str, Any] = {
                 "apiKey": self.api_key,
                 "sport": sport,
+                "status": "pending,live",
                 "limit": self.limit,
+                "skip": 0,
             }
+            params.update(janela)
             if league:
                 params["league"] = league
+            if bookmaker_param:
+                params["bookmaker"] = bookmaker_param
+
             try:
-                log.append(f"Consultando odds-api.io /events: sport={sport}; league={league or 'todas'}; limit={self.limit}.")
+                log.append(
+                    "Consultando odds-api.io /events: "
+                    f"sport={sport}; league={league or 'todas'}; "
+                    f"status={params.get('status')}; limit={self.limit}; "
+                    f"bookmaker={bookmaker_param or 'sem filtro'}"
+                )
                 data = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/events", params, log)
             except Exception as e:
                 log.append(f"Falha em /events para {item}: {e}")
@@ -1287,9 +1428,13 @@ class BettingOddsExtractor:
                     continue
                 if not self._evento_na_data_alvo(date):
                     pulados_data += 1
+                    if len(amostras_puladas) < 5:
+                        amostras_puladas.append(f"data: {home} x {away} em {date}")
                     continue
                 if not self._evento_no_filtro_de_equipes(home, away):
                     pulados_equipes += 1
+                    if len(amostras_puladas) < 5:
+                        amostras_puladas.append(f"equipe: {home} x {away} em {date}")
                     continue
                 ev2 = dict(ev)
                 ev2["_id"] = event_id
@@ -1301,10 +1446,26 @@ class BettingOddsExtractor:
                 event_map[event_id] = ev2
                 vistos.add(event_id)
 
+        if not eventos and self.team_filter and self.target_date is not None:
+            for ev in self._eventos_search_por_times_odds_api_io(log):
+                event_id = ev.get("_id") or self._extract_event_id(ev)
+                if event_id and event_id not in vistos:
+                    eventos.append(ev)
+                    event_map[event_id] = ev
+                    vistos.add(event_id)
+
         if self.target_date is not None:
             log.append(f"Filtro de data aplicado: {self.target_date.isoformat()} em {self.target_timezone}; eventos ignorados por data={pulados_data}.")
         if self.team_filter:
             log.append(f"Filtro de seleções aplicado: {len(self.team_filter)} nome(s) conhecidos; eventos ignorados por equipe={pulados_equipes}.")
+        if amostras_puladas:
+            log.append("Amostras de eventos ignorados: " + " | ".join(amostras_puladas))
+        if not eventos:
+            log.append(
+                "Diagnóstico: nenhum evento passou pelos filtros. "
+                "Use sport key 'football:international-fifa-world-cup', confira a data local do jogo, "
+                "ou desmarque temporariamente o filtro de seleções para testar a resposta bruta da API."
+            )
 
         return eventos, event_map
 
@@ -1418,6 +1579,7 @@ class BettingOddsExtractor:
             log.append(f"Filtro ativo: somente jogos em que as duas equipes existem na base/modelo ({len(self.team_filter)} seleção(ões)).")
 
         eventos, event_map = self._extrair_eventos_odds_api_io(log)
+        bookmakers_to_use = self._bookmakers_para_requisicao(log)
         if not eventos:
             log.append("Nenhum evento aproveitável foi encontrado em odds-api.io.")
             return OddsExtractionResult(raw=pd.DataFrame(), consensus=pd.DataFrame(), log=log)
@@ -1429,18 +1591,15 @@ class BettingOddsExtractor:
                     "apiKey": self.api_key,
                     "eventIds": ",".join(chunk),
                 }
-                if self.bookmakers:
-                    params["bookmakers"] = self.bookmakers
-                log.append(f"Consultando odds-api.io /odds/multi para {len(chunk)} evento(s); bookmakers={self.bookmakers or 'selecionados/todos da conta'}.")
+                params["bookmakers"] = bookmakers_to_use
+                log.append(f"Consultando odds-api.io /odds/multi para {len(chunk)} evento(s); bookmakers={bookmakers_to_use}.")
                 data = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/odds/multi", params, log)
             except Exception as e_multi:
                 log.append(f"Falha em /odds/multi: {e_multi}. Tentando /odds evento a evento.")
                 data = []
                 for event_id in chunk:
                     try:
-                        params = {"apiKey": self.api_key, "eventId": event_id}
-                        if self.bookmakers:
-                            params["bookmakers"] = self.bookmakers
+                        params = {"apiKey": self.api_key, "eventId": event_id, "bookmakers": bookmakers_to_use}
                         one = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/odds", params, log)
                         data.append(one)
                     except Exception as e_one:
@@ -1462,7 +1621,7 @@ class BettingOddsExtractor:
 
         raw = pd.DataFrame(rows)
         if raw.empty:
-            log.append("Eventos foram encontrados, mas nenhuma odd ML/1X2 aproveitável retornou. Verifique bookmakers selecionados no dashboard ou informe Bookmakers, ex.: Bet365,Unibet.")
+            log.append("Eventos foram encontrados, mas nenhuma odd ML/1X2 aproveitável retornou. Verifique se os bookmakers informados têm mercado ML para a partida. Teste também limpar o campo Bookmakers ou usar Bet365,Unibet.")
             return OddsExtractionResult(raw=raw, consensus=pd.DataFrame(), log=log)
         consensus = self.consolidar_consenso(raw)
         log.append(f"Odds brutas: {len(raw)} linha(s). Consenso: {len(consensus)} partida(s).")
