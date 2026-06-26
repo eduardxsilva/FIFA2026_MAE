@@ -669,13 +669,14 @@ def split_csv_local(valor: str) -> list[str]:
     return [x.strip() for x in str(valor or "").split(",") if x.strip()]
 
 
-def atualizar_odds_ao_vivo(api_key: str, sport_keys: str, regions: str, bookmakers: str = "") -> None:
+def atualizar_odds_ao_vivo(api_key: str, sport_keys: str, regions: str, bookmakers: str = "", provider: str = "odds-api-io") -> None:
     extractor = BettingOddsExtractor(
         api_key=api_key,
         sport_keys=split_csv_local(sport_keys),
         regions=regions,
         bookmakers=bookmakers.strip() or None,
         timeout=35,
+        provider=provider,
     )
     result = extractor.extrair_ao_vivo()
     st.session_state.df_odds_raw = result.raw.copy() if isinstance(result.raw, pd.DataFrame) else pd.DataFrame()
@@ -1492,20 +1493,26 @@ elif page == "Importar dados":
                 type="password",
                 help="Pode deixar vazio se você configurou ODDS_API_KEY no secrets.toml ou nas variáveis de ambiente.",
             )
+            odds_provider = st.selectbox(
+                "Provedor",
+                ["odds-api-io", "the-odds-api"],
+                index=0,
+                help="Use odds-api-io para chaves geradas em odds-api.io. Use the-odds-api só para chaves do the-odds-api.com.",
+            )
             odds_sport_keys = st.text_input(
-                "Sport keys",
-                value="soccer_fifa_world_cup,soccer_international_friendlies",
-                help="Use as chaves do provedor. Para Copa, tente soccer_fifa_world_cup; a disponibilidade depende do provedor e da data das partidas.",
+                "Esportes / sport keys",
+                value="football",
+                help="Para odds-api.io use football. Também aceita football:league. Para the-odds-api use soccer_fifa_world_cup,soccer_international_friendlies.",
             )
             odds_regions = st.text_input(
                 "Regiões",
-                value="eu,uk,us,us2,au",
-                help="Regiões aceitas pelo provedor de odds. Mais regiões consomem mais cota.",
+                value="",
+                help="Usado apenas no the-odds-api.com. No odds-api.io pode deixar vazio.",
             )
             odds_bookmakers = st.text_input(
                 "Bookmakers específicos, opcional",
-                value="",
-                help="Exemplo: bet365,betfair,williamhill. Vazio = todos disponíveis nas regiões.",
+                value="Bet365,Unibet",
+                help="No odds-api.io use nomes como Bet365,Unibet. Se deixar vazio, usa os bookmakers selecionados no dashboard da conta, quando o provedor permitir.",
             )
 
         if uploaded_unico is not None:
@@ -1553,7 +1560,7 @@ elif page == "Importar dados":
                                 st.warning("Odds não atualizadas: informe ODDS_API_KEY ou digite a API key no campo de configuração.")
                             else:
                                 with st.spinner("Consultando odds em tempo real e calculando consenso das casas..."):
-                                    atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys, odds_regions, odds_bookmakers)
+                                    atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys, odds_regions, odds_bookmakers, odds_provider)
 
                     metricas_tmp = obter_metricas_fifa_equipes_do_estado()
                     jogos_tmp = st.session_state.internet_extras.get("copa2026_jogos_fifa") if isinstance(st.session_state.internet_extras, dict) else None
@@ -1756,9 +1763,10 @@ elif page == "Prever partida":
             atualizar_agora = st.checkbox("Atualizar odds agora antes da previsão", value=False)
             if atualizar_agora:
                 odds_api_key_pred = st.text_input("API key das odds", value="", type="password", key="odds_api_key_prever")
-                odds_sport_keys_pred = st.text_input("Sport keys", value="soccer_fifa_world_cup,soccer_international_friendlies", key="odds_sport_keys_prever")
-                odds_regions_pred = st.text_input("Regiões", value="eu,uk,us,us2,au", key="odds_regions_prever")
-                odds_bookmakers_pred = st.text_input("Bookmakers específicos, opcional", value="", key="odds_books_prever")
+                odds_provider_pred = st.selectbox("Provedor", ["odds-api-io", "the-odds-api"], index=0, key="odds_provider_prever")
+                odds_sport_keys_pred = st.text_input("Esportes / sport keys", value="football", key="odds_sport_keys_prever")
+                odds_regions_pred = st.text_input("Regiões", value="", key="odds_regions_prever")
+                odds_bookmakers_pred = st.text_input("Bookmakers específicos, opcional", value="Bet365,Unibet", key="odds_books_prever")
 
         if st.button("Calcular previsão", type="primary", width="stretch", icon=":material/bolt:"):
             if mandante == visitante:
@@ -1780,7 +1788,7 @@ elif page == "Prever partida":
                             st.warning("Odds não atualizadas: informe ODDS_API_KEY ou digite a API key.")
                         else:
                             with st.spinner("Atualizando odds em tempo real..."):
-                                atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys_pred, odds_regions_pred, odds_bookmakers_pred)
+                                atualizar_odds_ao_vivo(api_key_odds, odds_sport_keys_pred, odds_regions_pred, odds_bookmakers_pred, odds_provider_pred)
 
                     odds_partida = BettingOddsExtractor.buscar_odds_partida(
                         st.session_state.df_odds_consenso, mandante, visitante

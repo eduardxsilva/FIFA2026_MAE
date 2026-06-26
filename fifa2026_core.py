@@ -946,20 +946,30 @@ class BettingOddsExtractor:
     """
     Integra odds 1X2 de futebol por API, sem scraping direto de sites de aposta.
 
-    Padrão implementado: The Odds API v4.
-    - mercado: h2h / 1X2
-    - odds: decimal
-    - saída bruta por casa
-    - consenso médio sem vig por partida
+    Suporta dois provedores:
+    1) odds-api.io (recomendado aqui, porque sua chave é desse serviço)
+       - Base URL: https://api.odds-api.io/v3
+       - Fluxo: /events -> /odds ou /odds/multi
+       - esporte padrão: football
+       - mercado usado: ML / Match Result / 1X2, quando disponível
 
-    Observação prática:
-    a disponibilidade de Copa do Mundo 2026 depende do provedor expor o sport_key
-    e de as partidas já estarem abertas nas casas consultadas.
+    2) the-odds-api.com
+       - Base URL: https://api.the-odds-api.com/v4
+       - Fluxo: /sports/{sport_key}/odds
+       - sport_key padrão: soccer_fifa_world_cup, etc.
+
+    A saída é padronizada:
+    - odds brutas por casa
+    - consenso médio sem vig por partida
+    - favorito das casas
     """
 
-    BASE_URL = "https://api.the-odds-api.com/v4"
+    ODDS_API_IO_BASE_URL = "https://api.odds-api.io/v3"
+    THE_ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
 
-    DEFAULT_SPORT_KEYS = [
+    DEFAULT_ODDS_API_IO_SPORTS = ["football"]
+
+    DEFAULT_THE_ODDS_API_SPORT_KEYS = [
         "soccer_fifa_world_cup",
         "soccer_international_friendlies",
         "soccer_conmebol_copa_america",
@@ -975,14 +985,22 @@ class BettingOddsExtractor:
         odds_format: str = "decimal",
         bookmakers: Optional[str] = None,
         timeout: int = 30,
+        provider: str = "odds-api-io",
+        limit: int = 100,
     ):
         self.api_key = str(api_key or "").strip()
-        self.sport_keys = [str(x).strip() for x in (sport_keys or self.DEFAULT_SPORT_KEYS) if str(x).strip()]
+        self.provider = self._normalizar_provider(provider)
+        if sport_keys is None:
+            sport_keys = self.DEFAULT_ODDS_API_IO_SPORTS if self.provider == "odds-api-io" else self.DEFAULT_THE_ODDS_API_SPORT_KEYS
+        self.sport_keys = [str(x).strip() for x in (sport_keys or []) if str(x).strip()]
+        if not self.sport_keys:
+            self.sport_keys = self.DEFAULT_ODDS_API_IO_SPORTS if self.provider == "odds-api-io" else self.DEFAULT_THE_ODDS_API_SPORT_KEYS
         self.regions = str(regions or "eu,uk,us,us2,au").strip()
         self.markets = str(markets or "h2h").strip()
         self.odds_format = str(odds_format or "decimal").strip()
         self.bookmakers = str(bookmakers or "").strip() or None
         self.timeout = int(timeout or 30)
+        self.limit = int(limit or 100)
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -992,6 +1010,13 @@ class BettingOddsExtractor:
             "Accept": "application/json",
             "Cache-Control": "no-cache",
         }
+
+    @staticmethod
+    def _normalizar_provider(provider: Any) -> str:
+        p = normalizar_texto(provider or "odds-api-io")
+        if p in {"the_odds_api", "theoddsapi", "the_odds_api_com", "the_odds"}:
+            return "the-odds-api"
+        return "odds-api-io"
 
     @staticmethod
     def _split_csv(valor: Any) -> List[str]:
@@ -1006,30 +1031,331 @@ class BettingOddsExtractor:
     @staticmethod
     def _is_draw_name(nome: Any) -> bool:
         n = normalizar_texto(nome)
-        return n in {"draw", "empate", "tie", "x"}
+        return n in {"draw", "empate", "tie", "x", "the_draw"}
+
+    @staticmethod
+    def _to_float_odd(valor: Any) -> float:
+        if valor is None:
+            return np.nan
+        try:
+            txt = str(valor).strip().replace(",", ".")
+            txt = re.sub(r"[^0-9.\-]", "", txt)
+            if not txt:
+                return np.nan
+            out = float(txt)
+            if out <= 1.0:
+                return np.nan
+            return out
+        except Exception:
+            return np.nan
+
+    @staticmethod
+    def _chunked(seq: List[Any], n: int) -> List[List[Any]]:
+        return [seq[i:i+n] for i in range(0, len(seq), n)]
 
     def _get_json(self, url: str, params: Dict[str, Any], log: List[str]) -> Any:
-        resp = requests.get(url, params=params, headers=self.headers, timeout=self.timeout)
-        remaining = resp.headers.get("x-requests-remaining")
-        used = resp.headers.get("x-requests-used")
+        clean_params = {k: v for k, v in params.items() if v not in (None, "", [], {})}
+        resp = requests.get(url, params=clean_params, headers=self.headers, timeout=self.timeout)
+        remaining = resp.headers.get("x-requests-remaining") or resp.headers.get("x-ratelimit-remaining")
+        used = resp.headers.get("x-requests-used") or resp.headers.get("x-ratelimit-used")
         if remaining is not None or used is not None:
-            log.append(f"Cota Odds API: usadas={used or 'n/d'} restantes={remaining or 'n/d'}.")
-        resp.raise_for_status()
+            log.append(f"Cota odds: usadas={used or 'n/d'} restantes={remaining or 'n/d'}.")
+        if resp.status_code >= 400:
+            detalhe = (resp.text or "")[:600]
+            raise RuntimeError(f"HTTP {resp.status_code}: {detalhe}")
         return resp.json()
 
     def listar_esportes_disponiveis(self) -> pd.DataFrame:
-        """Lista sport_keys disponíveis na conta/API usada."""
-        if not self.api_key:
-            raise ValueError("Informe a API key das odds.")
-        url = f"{self.BASE_URL}/sports"
-        data = self._get_json(url, {"apiKey": self.api_key}, [])
-        if not isinstance(data, list):
-            return pd.DataFrame()
-        return pd.DataFrame(data)
+        """Lista esportes disponíveis no provedor configurado."""
+        if self.provider == "odds-api-io":
+            data = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/sports", {}, [])
+        else:
+            if not self.api_key:
+                raise ValueError("Informe a API key das odds.")
+            data = self._get_json(f"{self.THE_ODDS_API_BASE_URL}/sports", {"apiKey": self.api_key}, [])
+        if isinstance(data, dict):
+            for key in ["data", "sports", "items", "results"]:
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+        return pd.DataFrame(data if isinstance(data, list) else [])
 
     def extrair_ao_vivo(self) -> OddsExtractionResult:
         if not self.api_key:
             raise ValueError("Informe a API key das odds.")
+        if self.provider == "the-odds-api":
+            return self._extrair_the_odds_api()
+        return self._extrair_odds_api_io()
+
+    # ------------------------------------------------------------
+    # Provedor 1: odds-api.io
+    # ------------------------------------------------------------
+
+    def _parse_sport_league(self, item: str) -> Tuple[str, Optional[str]]:
+        """
+        Permite formatos:
+        - football
+        - football:world-cup
+        - football|world-cup
+        """
+        s = str(item or "").strip()
+        for sep in [":", "|", "/"]:
+            if sep in s:
+                a, b = s.split(sep, 1)
+                return a.strip() or "football", b.strip() or None
+        return s or "football", None
+
+    def _extract_event_id(self, event: Dict[str, Any]) -> str:
+        for key in ["id", "eventId", "event_id", "fixtureId", "fixture_id", "gameId", "game_id"]:
+            v = event.get(key)
+            if v not in (None, ""):
+                return str(v)
+        return ""
+
+    def _parse_event_home_away(self, event: Dict[str, Any]) -> Tuple[str, str, str]:
+        home = event.get("home") or event.get("homeTeam") or event.get("home_team") or event.get("homeName")
+        away = event.get("away") or event.get("awayTeam") or event.get("away_team") or event.get("awayName")
+        date = event.get("date") or event.get("startTime") or event.get("commence_time") or event.get("time") or event.get("startsAt") or ""
+
+        if not home or not away:
+            participants = event.get("participants") or event.get("competitors") or event.get("teams") or []
+            if isinstance(participants, list):
+                for p in participants:
+                    if not isinstance(p, dict):
+                        continue
+                    name = p.get("name") or p.get("team") or p.get("title") or p.get("participantName")
+                    role = normalizar_texto(p.get("role") or p.get("type") or p.get("side") or p.get("qualifier") or "")
+                    is_home = bool(p.get("home") or p.get("isHome") or role in {"home", "mandante", "casa"})
+                    is_away = bool(p.get("away") or p.get("isAway") or role in {"away", "visitante", "fora"})
+                    if is_home and name:
+                        home = name
+                    elif is_away and name:
+                        away = name
+                if (not home or not away) and len(participants) >= 2:
+                    p0, p1 = participants[0], participants[1]
+                    if isinstance(p0, dict) and isinstance(p1, dict):
+                        home = home or p0.get("name") or p0.get("team") or p0.get("title")
+                        away = away or p1.get("name") or p1.get("team") or p1.get("title")
+                    else:
+                        home = home or str(p0)
+                        away = away or str(p1)
+
+        return canonical_team_name(home), canonical_team_name(away), str(date or "")
+
+    def _extrair_eventos_odds_api_io(self, log: List[str]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        eventos: List[Dict[str, Any]] = []
+        event_map: Dict[str, Dict[str, Any]] = {}
+        vistos = set()
+
+        for item in self.sport_keys:
+            sport, league = self._parse_sport_league(item)
+            params: Dict[str, Any] = {
+                "apiKey": self.api_key,
+                "sport": sport,
+                "limit": self.limit,
+            }
+            if league:
+                params["league"] = league
+            try:
+                log.append(f"Consultando odds-api.io /events: sport={sport}; league={league or 'todas'}; limit={self.limit}.")
+                data = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/events", params, log)
+            except Exception as e:
+                log.append(f"Falha em /events para {item}: {e}")
+                continue
+
+            if isinstance(data, dict):
+                for key in ["data", "events", "items", "results"]:
+                    if isinstance(data.get(key), list):
+                        data = data[key]
+                        break
+            if not isinstance(data, list) or not data:
+                log.append(f"{item}: nenhum evento retornado.")
+                continue
+
+            log.append(f"{item}: {len(data)} evento(s) retornado(s).")
+            for ev in data:
+                if not isinstance(ev, dict):
+                    continue
+                event_id = self._extract_event_id(ev)
+                if not event_id or event_id in vistos:
+                    continue
+                home, away, date = self._parse_event_home_away(ev)
+                if not home or not away:
+                    continue
+                ev2 = dict(ev)
+                ev2["_id"] = event_id
+                ev2["_home"] = home
+                ev2["_away"] = away
+                ev2["_date"] = date
+                ev2["_sport_item"] = item
+                eventos.append(ev2)
+                event_map[event_id] = ev2
+                vistos.add(event_id)
+
+        return eventos, event_map
+
+    def _extract_ml_from_odds_api_io_bookmakers(
+        self,
+        odds_event: Dict[str, Any],
+        event_map: Dict[str, Dict[str, Any]],
+        started: str,
+    ) -> List[Dict[str, Any]]:
+        event_id = self._extract_event_id(odds_event) or str(odds_event.get("id", ""))
+        mapped = event_map.get(event_id, {})
+        home, away, date = self._parse_event_home_away(odds_event)
+        home = home or mapped.get("_home", "")
+        away = away or mapped.get("_away", "")
+        date = date or mapped.get("_date", "")
+        if not home or not away:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        bookmakers = odds_event.get("bookmakers") or odds_event.get("books") or odds_event.get("sportsbooks") or {}
+
+        book_items: List[Tuple[str, Any]] = []
+        if isinstance(bookmakers, dict):
+            book_items = list(bookmakers.items())
+        elif isinstance(bookmakers, list):
+            for b in bookmakers:
+                if isinstance(b, dict):
+                    name = b.get("name") or b.get("title") or b.get("key") or b.get("bookmaker") or "Bookmaker"
+                    book_items.append((str(name), b.get("markets") or b.get("odds") or b))
+
+        for bookmaker_name, markets_obj in book_items:
+            markets = markets_obj
+            if isinstance(markets_obj, dict):
+                markets = markets_obj.get("markets") or markets_obj.get("odds") or markets_obj.get("data") or markets_obj
+            if isinstance(markets, dict):
+                markets = list(markets.values())
+            if not isinstance(markets, list):
+                continue
+
+            odds_home = np.nan
+            odds_draw = np.nan
+            odds_away = np.nan
+            last_update = ""
+
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                market_name = normalizar_texto(market.get("name") or market.get("key") or market.get("market") or "")
+                if market_name not in {"ml", "moneyline", "match_result", "match_winner", "1x2", "h2h", "full_time_result", "winner"}:
+                    # odds-api.io documenta ML para resultado da partida.
+                    continue
+                last_update = market.get("updatedAt") or market.get("updated_at") or market.get("lastUpdate") or last_update
+                odds_list = market.get("odds") or market.get("outcomes") or []
+                if isinstance(odds_list, dict):
+                    odds_list = [odds_list]
+                for odd_obj in odds_list:
+                    if not isinstance(odd_obj, dict):
+                        continue
+                    # Formato documentado: {'home': '2.10', 'draw': '3.40', 'away': '3.20'}
+                    h = self._to_float_odd(odd_obj.get("home"))
+                    d = self._to_float_odd(odd_obj.get("draw"))
+                    a = self._to_float_odd(odd_obj.get("away"))
+                    if not pd.isna(h):
+                        odds_home = h
+                    if not pd.isna(d):
+                        odds_draw = d
+                    if not pd.isna(a):
+                        odds_away = a
+
+                    # Formato alternativo: outcome por nome.
+                    name = odd_obj.get("name") or odd_obj.get("outcome") or odd_obj.get("label")
+                    price = self._to_float_odd(odd_obj.get("price") or odd_obj.get("odds") or odd_obj.get("value"))
+                    if not pd.isna(price) and name:
+                        nome_canon = canonical_team_name(name)
+                        if nome_canon == home:
+                            odds_home = price
+                        elif nome_canon == away:
+                            odds_away = price
+                        elif self._is_draw_name(name):
+                            odds_draw = price
+
+            if pd.isna(odds_home) or pd.isna(odds_away):
+                continue
+            rows.append(self._row_from_odds(
+                provider="odds-api.io",
+                sport_key=str(mapped.get("_sport_item", "football")),
+                event_id=event_id,
+                date=date,
+                home=home,
+                away=away,
+                home_raw=home,
+                away_raw=away,
+                bookmaker_key=bookmaker_name,
+                bookmaker_title=bookmaker_name,
+                last_update=str(last_update or ""),
+                odds_home=odds_home,
+                odds_draw=odds_draw,
+                odds_away=odds_away,
+                started=started,
+            ))
+        return rows
+
+    def _extrair_odds_api_io(self) -> OddsExtractionResult:
+        log: List[str] = []
+        rows: List[Dict[str, Any]] = []
+        started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        log.append(f"Iniciando consulta de odds em {started}.")
+        log.append("Fonte configurada: odds-api.io v3; fluxo /events -> /odds/multi; mercado ML/1X2; odds decimais.")
+
+        eventos, event_map = self._extrair_eventos_odds_api_io(log)
+        if not eventos:
+            log.append("Nenhum evento aproveitável foi encontrado em odds-api.io.")
+            return OddsExtractionResult(raw=pd.DataFrame(), consensus=pd.DataFrame(), log=log)
+
+        ids = [ev["_id"] for ev in eventos if ev.get("_id")]
+        for chunk in self._chunked(ids, 10):
+            try:
+                params: Dict[str, Any] = {
+                    "apiKey": self.api_key,
+                    "eventIds": ",".join(chunk),
+                }
+                if self.bookmakers:
+                    params["bookmakers"] = self.bookmakers
+                log.append(f"Consultando odds-api.io /odds/multi para {len(chunk)} evento(s); bookmakers={self.bookmakers or 'selecionados/todos da conta'}.")
+                data = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/odds/multi", params, log)
+            except Exception as e_multi:
+                log.append(f"Falha em /odds/multi: {e_multi}. Tentando /odds evento a evento.")
+                data = []
+                for event_id in chunk:
+                    try:
+                        params = {"apiKey": self.api_key, "eventId": event_id}
+                        if self.bookmakers:
+                            params["bookmakers"] = self.bookmakers
+                        one = self._get_json(f"{self.ODDS_API_IO_BASE_URL}/odds", params, log)
+                        data.append(one)
+                    except Exception as e_one:
+                        log.append(f"Falha em /odds para eventId={event_id}: {e_one}")
+
+            if isinstance(data, dict):
+                for key in ["data", "odds", "events", "items", "results"]:
+                    if isinstance(data.get(key), list):
+                        data = data[key]
+                        break
+                if isinstance(data, dict):
+                    data = [data]
+            if not isinstance(data, list):
+                continue
+            for odds_event in data:
+                if not isinstance(odds_event, dict):
+                    continue
+                rows.extend(self._extract_ml_from_odds_api_io_bookmakers(odds_event, event_map, started))
+
+        raw = pd.DataFrame(rows)
+        if raw.empty:
+            log.append("Eventos foram encontrados, mas nenhuma odd ML/1X2 aproveitável retornou. Verifique bookmakers selecionados no dashboard ou informe Bookmakers, ex.: Bet365,Unibet.")
+            return OddsExtractionResult(raw=raw, consensus=pd.DataFrame(), log=log)
+        consensus = self.consolidar_consenso(raw)
+        log.append(f"Odds brutas: {len(raw)} linha(s). Consenso: {len(consensus)} partida(s).")
+        return OddsExtractionResult(raw=raw, consensus=consensus, log=log)
+
+    # ------------------------------------------------------------
+    # Provedor 2: the-odds-api.com
+    # ------------------------------------------------------------
+
+    def _extrair_the_odds_api(self) -> OddsExtractionResult:
         if not self.sport_keys:
             raise ValueError("Informe ao menos um sport_key para consulta de odds.")
 
@@ -1040,7 +1366,7 @@ class BettingOddsExtractor:
         log.append("Fonte configurada: The Odds API v4; mercado h2h/1X2; odds decimais.")
 
         for sport_key in self.sport_keys:
-            url = f"{self.BASE_URL}/sports/{sport_key}/odds/"
+            url = f"{self.THE_ODDS_API_BASE_URL}/sports/{sport_key}/odds/"
             params: Dict[str, Any] = {
                 "apiKey": self.api_key,
                 "regions": self.regions,
@@ -1052,7 +1378,7 @@ class BettingOddsExtractor:
                 params["bookmakers"] = self.bookmakers
 
             try:
-                log.append(f"Consultando odds: sport_key={sport_key}; regions={self.regions}; bookmakers={self.bookmakers or 'todos da região'}.")
+                log.append(f"Consultando The Odds API: sport_key={sport_key}; regions={self.regions}; bookmakers={self.bookmakers or 'todos da região'}.")
                 data = self._get_json(url, params, log)
             except Exception as e:
                 log.append(f"Falha ao consultar {sport_key}: {e}")
@@ -1064,80 +1390,7 @@ class BettingOddsExtractor:
 
             log.append(f"{sport_key}: {len(data)} partida(s) retornada(s).")
             for event in data:
-                if not isinstance(event, dict):
-                    continue
-                home_raw = event.get("home_team", "")
-                away_raw = event.get("away_team", "")
-                home = canonical_team_name(home_raw)
-                away = canonical_team_name(away_raw)
-                if not home or not away:
-                    continue
-
-                commence_time = event.get("commence_time", "")
-                bookmakers_data = event.get("bookmakers") or []
-                for book in bookmakers_data:
-                    if not isinstance(book, dict):
-                        continue
-                    book_key = book.get("key", "")
-                    book_title = book.get("title", book_key)
-                    last_update = book.get("last_update", "")
-
-                    odds_home = np.nan
-                    odds_draw = np.nan
-                    odds_away = np.nan
-
-                    for market in book.get("markets") or []:
-                        if not isinstance(market, dict) or market.get("key") != "h2h":
-                            continue
-                        for outcome in market.get("outcomes") or []:
-                            if not isinstance(outcome, dict):
-                                continue
-                            nome_out = outcome.get("name", "")
-                            preco = pd.to_numeric(outcome.get("price"), errors="coerce")
-                            if pd.isna(preco) or float(preco) <= 1.0:
-                                continue
-                            nome_canon = canonical_team_name(nome_out)
-                            if nome_canon == home:
-                                odds_home = float(preco)
-                            elif nome_canon == away:
-                                odds_away = float(preco)
-                            elif self._is_draw_name(nome_out):
-                                odds_draw = float(preco)
-
-                    if pd.isna(odds_home) or pd.isna(odds_away):
-                        continue
-
-                    inv_home = 1.0 / float(odds_home)
-                    inv_draw = 1.0 / float(odds_draw) if not pd.isna(odds_draw) and float(odds_draw) > 1 else 0.0
-                    inv_away = 1.0 / float(odds_away)
-                    overround = inv_home + inv_draw + inv_away
-                    if overround <= 0:
-                        continue
-
-                    rows.append({
-                        "Sport_Key": sport_key,
-                        "Event_ID": event.get("id", ""),
-                        "Data_UTC": commence_time,
-                        "Mandante": home,
-                        "Visitante": away,
-                        "Mandante_Original": home_raw,
-                        "Visitante_Original": away_raw,
-                        "Bookmaker_Key": book_key,
-                        "Bookmaker": book_title,
-                        "Bookmaker_Last_Update": last_update,
-                        "Odds_Mandante": odds_home,
-                        "Odds_Empate": odds_draw,
-                        "Odds_Visitante": odds_away,
-                        "Overround": overround,
-                        "Prob_Bruta_Mandante": inv_home,
-                        "Prob_Bruta_Empate": inv_draw,
-                        "Prob_Bruta_Visitante": inv_away,
-                        "Prob_SemVig_Mandante": inv_home / overround,
-                        "Prob_SemVig_Empate": inv_draw / overround if inv_draw > 0 else 0.0,
-                        "Prob_SemVig_Visitante": inv_away / overround,
-                        "Match_Key": self._match_key(home, away),
-                        "Extraido_UTC": started,
-                    })
+                rows.extend(self._extract_rows_from_the_odds_api_event(event, sport_key, started))
 
         raw = pd.DataFrame(rows)
         if raw.empty:
@@ -1147,6 +1400,120 @@ class BettingOddsExtractor:
         consensus = self.consolidar_consenso(raw)
         log.append(f"Odds brutas: {len(raw)} linha(s). Consenso: {len(consensus)} partida(s).")
         return OddsExtractionResult(raw=raw, consensus=consensus, log=log)
+
+    def _extract_rows_from_the_odds_api_event(self, event: Dict[str, Any], sport_key: str, started: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not isinstance(event, dict):
+            return rows
+        home_raw = event.get("home_team", "")
+        away_raw = event.get("away_team", "")
+        home = canonical_team_name(home_raw)
+        away = canonical_team_name(away_raw)
+        if not home or not away:
+            return rows
+
+        commence_time = event.get("commence_time", "")
+        bookmakers_data = event.get("bookmakers") or []
+        for book in bookmakers_data:
+            if not isinstance(book, dict):
+                continue
+            book_key = book.get("key", "")
+            book_title = book.get("title", book_key)
+            last_update = book.get("last_update", "")
+
+            odds_home = np.nan
+            odds_draw = np.nan
+            odds_away = np.nan
+
+            for market in book.get("markets") or []:
+                if not isinstance(market, dict) or market.get("key") != "h2h":
+                    continue
+                for outcome in market.get("outcomes") or []:
+                    if not isinstance(outcome, dict):
+                        continue
+                    nome_out = outcome.get("name", "")
+                    preco = self._to_float_odd(outcome.get("price"))
+                    if pd.isna(preco):
+                        continue
+                    nome_canon = canonical_team_name(nome_out)
+                    if nome_canon == home:
+                        odds_home = float(preco)
+                    elif nome_canon == away:
+                        odds_away = float(preco)
+                    elif self._is_draw_name(nome_out):
+                        odds_draw = float(preco)
+
+            if pd.isna(odds_home) or pd.isna(odds_away):
+                continue
+            rows.append(self._row_from_odds(
+                provider="the-odds-api.com",
+                sport_key=sport_key,
+                event_id=event.get("id", ""),
+                date=commence_time,
+                home=home,
+                away=away,
+                home_raw=home_raw,
+                away_raw=away_raw,
+                bookmaker_key=book_key,
+                bookmaker_title=book_title,
+                last_update=last_update,
+                odds_home=odds_home,
+                odds_draw=odds_draw,
+                odds_away=odds_away,
+                started=started,
+            ))
+        return rows
+
+    def _row_from_odds(
+        self,
+        provider: str,
+        sport_key: str,
+        event_id: Any,
+        date: Any,
+        home: str,
+        away: str,
+        home_raw: Any,
+        away_raw: Any,
+        bookmaker_key: Any,
+        bookmaker_title: Any,
+        last_update: Any,
+        odds_home: float,
+        odds_draw: float,
+        odds_away: float,
+        started: str,
+    ) -> Dict[str, Any]:
+        inv_home = 1.0 / float(odds_home)
+        inv_draw = 1.0 / float(odds_draw) if not pd.isna(odds_draw) and float(odds_draw) > 1 else 0.0
+        inv_away = 1.0 / float(odds_away)
+        overround = inv_home + inv_draw + inv_away
+        if overround <= 0:
+            overround = np.nan
+
+        return {
+            "Provider": provider,
+            "Sport_Key": sport_key,
+            "Event_ID": event_id,
+            "Data_UTC": date,
+            "Mandante": home,
+            "Visitante": away,
+            "Mandante_Original": home_raw,
+            "Visitante_Original": away_raw,
+            "Bookmaker_Key": bookmaker_key,
+            "Bookmaker": bookmaker_title,
+            "Bookmaker_Last_Update": last_update,
+            "Odds_Mandante": odds_home,
+            "Odds_Empate": odds_draw,
+            "Odds_Visitante": odds_away,
+            "Overround": overround,
+            "Prob_Bruta_Mandante": inv_home,
+            "Prob_Bruta_Empate": inv_draw,
+            "Prob_Bruta_Visitante": inv_away,
+            "Prob_SemVig_Mandante": inv_home / overround if overround and not pd.isna(overround) else np.nan,
+            "Prob_SemVig_Empate": inv_draw / overround if inv_draw > 0 and overround and not pd.isna(overround) else 0.0,
+            "Prob_SemVig_Visitante": inv_away / overround if overround and not pd.isna(overround) else np.nan,
+            "Match_Key": self._match_key(home, away),
+            "Extraido_UTC": started,
+        }
 
     @staticmethod
     def consolidar_consenso(raw: pd.DataFrame) -> pd.DataFrame:
@@ -1159,6 +1526,7 @@ class BettingOddsExtractor:
             return pd.DataFrame()
 
         agg = d.groupby(["Match_Key", "Mandante", "Visitante"], as_index=False).agg(
+            Provider=("Provider", lambda x: ", ".join(sorted(set(map(str, x)))[:3]) if "Provider" in d.columns else ""),
             Data_UTC=("Data_UTC", "min"),
             Casas_Usadas=("Bookmaker", "nunique"),
             Casas_Lista=("Bookmaker", lambda x: ", ".join(sorted(set(map(str, x)))[:18])),
@@ -1184,9 +1552,9 @@ class BettingOddsExtractor:
         confs = []
         for _, row in agg.iterrows():
             probs = {
-                str(row["Mandante"]): float(row["Prob_Mercado_Mandante_pct"]),
-                "Empate": float(row["Prob_Mercado_Empate_pct"]),
-                str(row["Visitante"]): float(row["Prob_Mercado_Visitante_pct"]),
+                str(row["Mandante"]): float(row.get("Prob_Mercado_Mandante_pct", 0) or 0),
+                "Empate": float(row.get("Prob_Mercado_Empate_pct", 0) or 0),
+                str(row["Visitante"]): float(row.get("Prob_Mercado_Visitante_pct", 0) or 0),
             }
             ordenado = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
             favoritos.append(ordenado[0][0])
@@ -1195,7 +1563,7 @@ class BettingOddsExtractor:
         agg["Margem_Favorito_Mercado_p.p."] = confs
 
         cols = [
-            "Data_UTC", "Mandante", "Visitante", "Casas_Usadas", "Casas_Lista",
+            "Provider", "Data_UTC", "Mandante", "Visitante", "Casas_Usadas", "Casas_Lista",
             "Odds_Media_Mandante", "Odds_Media_Empate", "Odds_Media_Visitante",
             "Prob_Mercado_Mandante_pct", "Prob_Mercado_Empate_pct", "Prob_Mercado_Visitante_pct",
             "Favorito_Casas", "Margem_Favorito_Mercado_p.p.", "Overround_Medio", "Atualizado_UTC", "Match_Key",
@@ -1301,7 +1669,6 @@ class BettingOddsExtractor:
         out["Favorito_Casas"] = max(probs, key=probs.get)
         out["Orientacao_Modelo"] = "invertida"
         return out
-
 
 def combinar_previsao_com_odds(previsao_ensemble: Dict[str, Any], odds_partida: Optional[Dict[str, Any]], peso_odds: float = 0.35) -> Optional[Dict[str, Any]]:
     """
