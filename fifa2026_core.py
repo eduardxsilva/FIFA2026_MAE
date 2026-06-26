@@ -2939,6 +2939,8 @@ class WorldCupFormatSimulator:
         random_state: int = 42,
         equipes_copa: Optional[List[str]] = None,
         grupos_copa: Optional[pd.DataFrame] = None,
+        jogos_copa: Optional[pd.DataFrame] = None,
+        classificados_copa: Optional[pd.DataFrame] = None,
     ):
         self.poisson_model = poisson_model
         self.ml_model = ml_model
@@ -2949,6 +2951,23 @@ class WorldCupFormatSimulator:
         self.grupos_copa = grupos_copa.copy() if isinstance(grupos_copa, pd.DataFrame) and not grupos_copa.empty else None
         if self.grupos_copa is not None and "Equipe" in self.grupos_copa.columns:
             self.grupos_copa["Equipe"] = self.grupos_copa["Equipe"].apply(canonical_team_name)
+            if "Grupo" in self.grupos_copa.columns:
+                self.grupos_copa["Grupo"] = self.grupos_copa["Grupo"].astype(str).str.upper().str.strip()
+
+        self.jogos_copa = jogos_copa.copy() if isinstance(jogos_copa, pd.DataFrame) and not jogos_copa.empty else None
+        if self.jogos_copa is not None:
+            if "Time_A" in self.jogos_copa.columns:
+                self.jogos_copa["Time_A"] = self.jogos_copa["Time_A"].apply(canonical_team_name)
+            if "Time_B" in self.jogos_copa.columns:
+                self.jogos_copa["Time_B"] = self.jogos_copa["Time_B"].apply(canonical_team_name)
+            if "Grupo" in self.jogos_copa.columns:
+                self.jogos_copa["Grupo"] = self.jogos_copa["Grupo"].astype(str).str.upper().str.strip()
+            if "Fase" in self.jogos_copa.columns:
+                self.jogos_copa["Fase"] = self.jogos_copa["Fase"].astype(str).str.strip()
+
+        self.classificados_copa = classificados_copa.copy() if isinstance(classificados_copa, pd.DataFrame) and not classificados_copa.empty else None
+        if self.classificados_copa is not None and "Equipe" in self.classificados_copa.columns:
+            self.classificados_copa["Equipe"] = self.classificados_copa["Equipe"].apply(canonical_team_name)
 
     def _forca_time(self, equipe: str) -> float:
         return self.base._forca_time(equipe)
@@ -2995,29 +3014,143 @@ class WorldCupFormatSimulator:
         row = m.loc[self.rng.choice(m.index.to_numpy(), p=m["P"].to_numpy())]
         return int(row["Gols_A"]), int(row["Gols_B"])
 
-    def _simular_grupo(self, grupo: str, equipes: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    @staticmethod
+    def _slot_placeholder(valor: Any) -> bool:
+        """Detecta slots de mata-mata da FIFA: 1H, 3CEFHI, W73, RU101 etc."""
+        s = str(valor or "").strip().upper().replace(" ", "")
+        return bool(re.fullmatch(r"(?:[123][A-L]{1,5}|W\d+|RU\d+|TBD)", s))
+
+    @staticmethod
+    def _status_jogo_concluido(valor: Any) -> bool:
+        s = normalizar_texto(valor or "")
+        return any(tok in s for tok in ["ft", "final", "complete", "completed", "encerrado", "aet", "pen"])
+
+    def _tabela_inicial_grupo(self, grupo: str, equipes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+        """Usa a classificação FIFA atual como ponto de partida, quando ela existe."""
         tabela = {
-            e: {"Equipe": e, "Pontos": 0, "Jogos": 0, "Vitorias": 0, "Empates": 0, "Derrotas": 0, "GP": 0, "GC": 0, "SG": 0, "Forca": self._forca_time(e)}
+            e: {
+                "Equipe": e,
+                "Pontos": 0,
+                "Jogos": 0,
+                "Vitorias": 0,
+                "Empates": 0,
+                "Derrotas": 0,
+                "GP": 0,
+                "GC": 0,
+                "SG": 0,
+                "Forca": self._forca_time(e),
+            }
             for e in equipes
         }
+        usou_estado_real = False
+        if self.grupos_copa is None or "Equipe" not in self.grupos_copa.columns:
+            return tabela, usou_estado_real
+
+        gdf = self.grupos_copa.copy()
+        if "Grupo" in gdf.columns:
+            gdf = gdf[gdf["Grupo"].astype(str).str.upper().str.strip() == str(grupo).upper().strip()]
+        gdf = gdf[gdf["Equipe"].astype(str).isin(equipes)]
+        if gdf.empty:
+            return tabela, usou_estado_real
+
+        for _, r in gdf.iterrows():
+            e = str(r.get("Equipe", ""))
+            if e not in tabela:
+                continue
+            for col, default in [
+                ("Pontos", 0), ("Jogos", 0), ("Vitorias", 0), ("Empates", 0),
+                ("Derrotas", 0), ("GP", 0), ("GC", 0), ("SG", 0),
+            ]:
+                if col in gdf.columns:
+                    val = pd.to_numeric(r.get(col, default), errors="coerce")
+                    tabela[e][col] = int(val) if pd.notna(val) else default
+            if "SG" not in gdf.columns or pd.isna(pd.to_numeric(r.get("SG", np.nan), errors="coerce")):
+                tabela[e]["SG"] = tabela[e]["GP"] - tabela[e]["GC"]
+            if tabela[e]["Jogos"] > 0 or tabela[e]["Pontos"] > 0 or tabela[e]["GP"] > 0 or tabela[e]["GC"] > 0:
+                usou_estado_real = True
+        return tabela, usou_estado_real
+
+    def _jogos_reais_grupo(self, grupo: str, equipes: List[str]) -> pd.DataFrame:
+        if self.jogos_copa is None or self.jogos_copa.empty:
+            return pd.DataFrame()
+        jogos = self.jogos_copa.copy()
+        if "Time_A" not in jogos.columns or "Time_B" not in jogos.columns:
+            return pd.DataFrame()
+        jogos = jogos[jogos["Time_A"].astype(str).isin(equipes) & jogos["Time_B"].astype(str).isin(equipes)]
+        if "Grupo" in jogos.columns:
+            jogos = jogos[(jogos["Grupo"].astype(str).str.upper().str.strip() == str(grupo).upper().strip()) | jogos["Grupo"].astype(str).str.strip().eq("")]
+        if "Fase" in jogos.columns:
+            fase_norm = jogos["Fase"].astype(str).apply(normalizar_texto)
+            jogos = jogos[fase_norm.str.contains("first_stage|grupo|group", regex=True, na=False) | fase_norm.eq("")]
+        return jogos.reset_index(drop=True)
+
+    def _aplicar_resultado_tabela(self, tabela: Dict[str, Dict[str, Any]], a: str, b: str, ga: int, gb: int) -> None:
+        for team, gf, gc in [(a, ga, gb), (b, gb, ga)]:
+            tabela[team]["Jogos"] += 1
+            tabela[team]["GP"] += gf
+            tabela[team]["GC"] += gc
+            tabela[team]["SG"] = tabela[team]["GP"] - tabela[team]["GC"]
+        if ga > gb:
+            tabela[a]["Pontos"] += 3
+            tabela[a]["Vitorias"] += 1
+            tabela[b]["Derrotas"] += 1
+        elif gb > ga:
+            tabela[b]["Pontos"] += 3
+            tabela[b]["Vitorias"] += 1
+            tabela[a]["Derrotas"] += 1
+        else:
+            tabela[a]["Pontos"] += 1
+            tabela[b]["Pontos"] += 1
+            tabela[a]["Empates"] += 1
+            tabela[b]["Empates"] += 1
+
+    def _simular_grupo(self, grupo: str, equipes: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Simula apenas o que falta da fase de grupos.
+
+        Se a classificação FIFA já tem pontos/jogos, ela vira o estado inicial.
+        Jogos concluídos da aba copa2026_jogos_fifa entram no log, mas não são
+        somados de novo quando a tabela oficial já traz esses pontos. Assim uma
+        seleção já classificada não volta a ser tratada como grupo zerado.
+        """
+        tabela, usou_estado_real = self._tabela_inicial_grupo(grupo, equipes)
         jogos = []
+        pares_concluidos = set()
+        jogos_reais = self._jogos_reais_grupo(grupo, equipes)
+
+        if not jogos_reais.empty:
+            for _, r in jogos_reais.iterrows():
+                a, b = str(r.get("Time_A", "")), str(r.get("Time_B", ""))
+                if a not in tabela or b not in tabela:
+                    continue
+                ga = pd.to_numeric(r.get("Gols_A", np.nan), errors="coerce")
+                gb = pd.to_numeric(r.get("Gols_B", np.nan), errors="coerce")
+                status = r.get("Status", "")
+                concluido = self._status_jogo_concluido(status) or (pd.notna(ga) and pd.notna(gb))
+                if concluido:
+                    pares_concluidos.add(tuple(sorted([a, b])))
+                    ga_i = int(ga) if pd.notna(ga) else 0
+                    gb_i = int(gb) if pd.notna(gb) else 0
+                    if not usou_estado_real:
+                        self._aplicar_resultado_tabela(tabela, a, b, ga_i, gb_i)
+                    jogos.append({
+                        "Grupo": grupo, "Time_A": a, "Time_B": b,
+                        "Gols_A": ga_i, "Gols_B": gb_i,
+                        "Status": "Real/Concluído", "Fonte": r.get("Fonte", "copa2026_jogos_fifa"),
+                    })
+
         for i in range(len(equipes)):
             for j in range(i + 1, len(equipes)):
                 a, b = equipes[i], equipes[j]
+                par = tuple(sorted([a, b]))
+                if par in pares_concluidos:
+                    continue
+                # Se todos já têm 3 jogos na tabela oficial, o grupo está encerrado.
+                if usou_estado_real and tabela[a].get("Jogos", 0) >= 3 and tabela[b].get("Jogos", 0) >= 3:
+                    continue
                 ga, gb = self._simular_placar_neutro(a, b)
-                for team, gf, gc in [(a, ga, gb), (b, gb, ga)]:
-                    tabela[team]["Jogos"] += 1
-                    tabela[team]["GP"] += gf
-                    tabela[team]["GC"] += gc
-                    tabela[team]["SG"] = tabela[team]["GP"] - tabela[team]["GC"]
-                if ga > gb:
-                    tabela[a]["Pontos"] += 3; tabela[a]["Vitorias"] += 1; tabela[b]["Derrotas"] += 1
-                elif gb > ga:
-                    tabela[b]["Pontos"] += 3; tabela[b]["Vitorias"] += 1; tabela[a]["Derrotas"] += 1
-                else:
-                    tabela[a]["Pontos"] += 1; tabela[b]["Pontos"] += 1
-                    tabela[a]["Empates"] += 1; tabela[b]["Empates"] += 1
-                jogos.append({"Grupo": grupo, "Time_A": a, "Time_B": b, "Gols_A": ga, "Gols_B": gb})
+                self._aplicar_resultado_tabela(tabela, a, b, ga, gb)
+                jogos.append({"Grupo": grupo, "Time_A": a, "Time_B": b, "Gols_A": ga, "Gols_B": gb, "Status": "Simulado", "Fonte": "modelo"})
 
         tab = pd.DataFrame(tabela.values())
         tab["Grupo"] = grupo

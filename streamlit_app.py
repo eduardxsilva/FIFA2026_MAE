@@ -703,6 +703,35 @@ def atualizar_odds_ao_vivo(
         team_filter=equipes_filtro,
     )
     result = extractor.extrair_ao_vivo()
+
+    # Teste real em dois passos: primeiro com filtro de seleções; se vier vazio,
+    # repete a mesma data/liga/bookmakers sem o filtro. Isso separa problema de
+    # API vazia de problema de normalização de nomes.
+    if (
+        filtrar_equipes
+        and (not isinstance(result.consensus, pd.DataFrame) or result.consensus.empty)
+        and equipes_filtro
+    ):
+        log_primeira = list(result.log or [])
+        log_primeira.append("--- RETESTE AUTOMÁTICO: sem filtro de seleções reconhecidas ---")
+        extractor_sem_filtro = BettingOddsExtractor(
+            api_key=api_key,
+            sport_keys=split_csv_local(sport_keys),
+            regions=regions,
+            bookmakers=bookmakers.strip() or None,
+            timeout=35,
+            provider=provider,
+            target_date=data_partidas,
+            target_timezone="America/Sao_Paulo",
+            team_filter=[],
+        )
+        result_sem_filtro = extractor_sem_filtro.extrair_ao_vivo()
+        result = type(result)(
+            raw=result_sem_filtro.raw,
+            consensus=result_sem_filtro.consensus,
+            log=log_primeira + list(result_sem_filtro.log or []),
+        )
+
     st.session_state.df_odds_raw = result.raw.copy() if isinstance(result.raw, pd.DataFrame) else pd.DataFrame()
     st.session_state.df_odds_consenso = result.consensus.copy() if isinstance(result.consensus, pd.DataFrame) else pd.DataFrame()
     st.session_state.odds_log = result.log
@@ -953,74 +982,272 @@ def _padronizar_classificacao_copa_local(df: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates(subset=["Grupo", "Equipe"]).reset_index(drop=True)
 
 
+def _empty_jogos_copa_local() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "Data", "Hora", "Fase", "Grupo", "Time_A", "Codigo_A", "Time_B", "Codigo_B",
+        "Gols_A", "Gols_B", "Status", "Estadio", "Cidade", "Fonte", "Ordem"
+    ])
+
+
+def _is_data_fifa_token_local(valor: str) -> bool:
+    return bool(re.fullmatch(
+        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}\s+[A-Za-z]+\s+2026",
+        str(valor or "").strip(),
+        flags=re.I,
+    ))
+
+
+def _parse_data_fifa_token_local(valor: str) -> str:
+    meses = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+    m = re.fullmatch(
+        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+        str(valor or "").strip(),
+        flags=re.I,
+    )
+    if not m:
+        return str(valor or "").strip()
+    dia = int(m.group(1))
+    mes = meses.get(m.group(2).lower(), 1)
+    ano = int(m.group(3))
+    return datetime(ano, mes, dia).date().isoformat()
+
+
+def _is_hora_fifa_token_local(valor: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}:\d{2}", str(valor or "").strip()))
+
+
+def _is_int_fifa_token_local(valor: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}", str(valor or "").strip()))
+
+
+def _is_fase_fifa_token_local(valor: str) -> bool:
+    fases = {
+        _normalizar_coluna_local(x) for x in [
+            "First Stage", "Round of 32", "Round of 16", "Quarter-final",
+            "Semi-final", "Final", "Play-off for third place",
+        ]
+    }
+    return _normalizar_coluna_local(valor) in fases
+
+
+def _slot_fifa_placeholder_local(valor) -> bool:
+    s = str(valor or "").strip().upper().replace(" ", "")
+    return bool(re.fullmatch(r"(?:[123][A-L]{1,5}|W\d+|RU\d+|TBD)", s))
+
+
+def _extract_codigo_nome_fifa_local(valor) -> tuple[str, str]:
+    s = str(valor or "").replace("\xa0", " ").strip()
+    s = " ".join(s.split())
+    m = re.match(r"^([A-Z]{3})\s+(.+)$", s)
+    if m and not re.fullmatch(r"[A-Z0-9]+", m.group(2).strip()):
+        return m.group(1).upper(), _canonical_team_local(m.group(2).strip())
+    if _slot_fifa_placeholder_local(s):
+        return "", s.upper().replace(" ", "")
+    return "", _canonical_team_local(s)
+
+
+def _tokenizar_texto_jogos_fifa_local(texto: str) -> list[str]:
+    texto = str(texto or "").replace("\xa0", " ")
+    texto = re.sub(r"\s+", " ", texto)
+    fases = [
+        "First Stage", "Round of 32", "Round of 16", "Quarter-final",
+        "Semi-final", "Final", "Play-off for third place",
+    ]
+    # Corrige colagens comuns do DOM: "South Africa First Stage" e "New Zealand 00:00".
+    for fase in fases:
+        texto = re.sub(rf"\s+({re.escape(fase)})\b", r" | \1", texto)
+    texto = re.sub(r"(?<=[A-Za-zÀ-ÖØ-öø-ÿ\)])\s+(\d{1,2}:\d{2})\b", r" | \1", texto)
+    texto = texto.replace(" · ", " | · | ")
+    texto = re.sub(
+        r"\b((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}\s+[A-Za-z]+\s+2026)\b",
+        r"| \1 |",
+        texto,
+    )
+    return [t.strip() for t in texto.split("|") if t and t.strip() and t.strip().lower() != "nan"]
+
+
+def _parse_textos_jogos_fifa_local(textos: list[str], fonte: str = "copa2026_jogos_fifa") -> pd.DataFrame:
+    if not textos:
+        return _empty_jogos_copa_local()
+
+    texto = " | ".join(str(t) for t in textos if str(t).strip() and str(t).strip().lower() != "nan")
+    tokens = _tokenizar_texto_jogos_fifa_local(texto)
+    if not tokens:
+        return _empty_jogos_copa_local()
+
+    rows = []
+    data_atual = ""
+    ordem = 0
+    ignorar = {"view groups", "view brackets", "·"}
+
+    for i, token in enumerate(tokens):
+        token_limpo = str(token).strip()
+        if _is_data_fifa_token_local(token_limpo):
+            data_atual = _parse_data_fifa_token_local(token_limpo)
+            continue
+        if not data_atual:
+            continue
+        low = token_limpo.lower()
+        if low in ignorar or low.startswith(("match fixtures", "sort by", "where to watch", "latest fifa")):
+            continue
+
+        if i + 5 < len(tokens) and _is_int_fifa_token_local(tokens[i + 1]) and str(tokens[i + 2]).upper() in {"FT", "AET", "PEN", "LIVE"} and _is_int_fifa_token_local(tokens[i + 3]):
+            raw_a = token_limpo
+            raw_b = tokens[i + 4]
+            fase_idx = i + 5
+            hora = ""
+            gols_a = int(tokens[i + 1])
+            gols_b = int(tokens[i + 3])
+            status = str(tokens[i + 2]).upper()
+        elif i + 3 < len(tokens) and _is_hora_fifa_token_local(tokens[i + 1]):
+            raw_a = token_limpo
+            raw_b = tokens[i + 2]
+            fase_idx = i + 3
+            hora = str(tokens[i + 1]).strip()
+            gols_a = pd.NA
+            gols_b = pd.NA
+            status = "Scheduled"
+        else:
+            continue
+
+        fase = str(tokens[fase_idx]).strip() if fase_idx < len(tokens) else ""
+        if not _is_fase_fifa_token_local(fase):
+            continue
+
+        codigo_a, time_a = _extract_codigo_nome_fifa_local(raw_a)
+        codigo_b, time_b = _extract_codigo_nome_fifa_local(raw_b)
+        if not time_a or not time_b:
+            continue
+
+        grupo = ""
+        estadio = ""
+        cidade = ""
+        busca = [str(x).strip() for x in tokens[fase_idx + 1:fase_idx + 9]]
+        pos_depois_grupo = 0
+        if _normalizar_coluna_local(fase) == "first_stage":
+            for j, item in enumerate(busca):
+                m_grupo = re.search(r"Group\s+([A-L])", item, flags=re.I)
+                if m_grupo:
+                    grupo = m_grupo.group(1).upper()
+                    pos_depois_grupo = j + 1
+                    break
+        else:
+            grupo = "Mata-mata"
+
+        resto = [x for x in busca[pos_depois_grupo:] if x and x != "·"]
+        if resto and re.match(r"Group\s+[A-L]", resto[0], flags=re.I):
+            resto = resto[1:]
+        if resto:
+            estadio = resto[0]
+        if len(resto) > 1 and re.match(r"^\(.+\)$", resto[1]):
+            cidade = resto[1].strip("()")
+
+        ordem += 1
+        rows.append({
+            "Data": data_atual,
+            "Hora": hora,
+            "Fase": fase,
+            "Grupo": grupo,
+            "Time_A": time_a,
+            "Codigo_A": codigo_a,
+            "Time_B": time_b,
+            "Codigo_B": codigo_b,
+            "Gols_A": gols_a,
+            "Gols_B": gols_b,
+            "Status": status,
+            "Estadio": estadio,
+            "Cidade": cidade,
+            "Fonte": fonte,
+            "Ordem": ordem,
+        })
+
+    if not rows:
+        return _empty_jogos_copa_local()
+
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["Data", "Hora", "Fase", "Time_A", "Time_B"], keep="first").reset_index(drop=True)
+    out["Ordem"] = range(1, len(out) + 1)
+    return out
+
+
+def _parse_jogos_fifa_de_dataframe_local(df: pd.DataFrame, fonte: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_jogos_copa_local()
+    textos = []
+    for col in ["trecho", "texto", "Texto", "text", "content", "Conteudo", "Conteúdo"]:
+        if col in df.columns:
+            textos.extend(df[col].dropna().astype(str).tolist())
+    # Fallback: usa todas as células textuais se o nome das colunas mudou.
+    if not textos:
+        try:
+            textos = df.astype(str).fillna("").agg(" | ".join, axis=1).tolist()
+        except Exception:
+            textos = []
+    return _parse_textos_jogos_fifa_local(textos, fonte=fonte)
+
+
 def _padronizar_jogos_copa_local(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Data", "Grupo", "Time_A", "Time_B", "Gols_A", "Gols_B", "Status", "Fonte"])
+        return _empty_jogos_copa_local()
     d = df.copy()
     d.columns = [" ".join(str(c).split()) for c in d.columns]
     col_data = _encontrar_coluna_local(d, ["Data", "Date", "Match Date"])
-    col_grupo = _encontrar_coluna_local(d, ["Grupo", "Group", "Stage"])
+    col_hora = _encontrar_coluna_local(d, ["Hora", "Time", "Kickoff", "Kick-off"])
+    col_fase = _encontrar_coluna_local(d, ["Fase", "Round", "Stage"])
+    col_grupo = _encontrar_coluna_local(d, ["Grupo", "Group"])
     col_a = _encontrar_coluna_local(d, ["Time_A", "Mandante", "Home", "Team A", "Equipe A"])
     col_b = _encontrar_coluna_local(d, ["Time_B", "Visitante", "Away", "Team B", "Equipe B"])
     col_ga = _encontrar_coluna_local(d, ["Gols_A", "Home Goals", "Gols Casa", "Score A"])
     col_gb = _encontrar_coluna_local(d, ["Gols_B", "Away Goals", "Gols Fora", "Score B"])
     col_status = _encontrar_coluna_local(d, ["Status", "State"])
+    col_estadio = _encontrar_coluna_local(d, ["Estadio", "Estádio", "Stadium", "Venue"])
+    col_cidade = _encontrar_coluna_local(d, ["Cidade", "City"])
+
     if col_a is None or col_b is None:
-        return pd.DataFrame(columns=["Data", "Grupo", "Time_A", "Time_B", "Gols_A", "Gols_B", "Status", "Fonte"])
+        return _parse_jogos_fifa_de_dataframe_local(d, fonte="copa2026_jogos_fifa_texto_bruto")
+
     out = pd.DataFrame()
-    out["Data"] = d[col_data].astype(str) if col_data else ""
+    out["Data"] = pd.to_datetime(d[col_data], errors="coerce").dt.date.astype(str) if col_data else ""
+    out["Hora"] = d[col_hora].astype(str).str.strip() if col_hora else ""
+    out["Fase"] = d[col_fase].astype(str).str.strip() if col_fase else ""
     out["Grupo"] = d[col_grupo].astype(str).str.upper().str.replace("GROUP", "", regex=False).str.strip() if col_grupo else ""
     out["Time_A"] = d[col_a].apply(_canonical_team_local)
+    out["Codigo_A"] = ""
     out["Time_B"] = d[col_b].apply(_canonical_team_local)
+    out["Codigo_B"] = ""
     out["Gols_A"] = pd.to_numeric(d[col_ga], errors="coerce") if col_ga else pd.NA
     out["Gols_B"] = pd.to_numeric(d[col_gb], errors="coerce") if col_gb else pd.NA
     out["Status"] = d[col_status].astype(str) if col_status else ""
+    out["Estadio"] = d[col_estadio].astype(str) if col_estadio else ""
+    out["Cidade"] = d[col_cidade].astype(str) if col_cidade else ""
     out["Fonte"] = "arquivo_local"
     out = out[out["Time_A"].astype(str).str.strip().ne("") & out["Time_B"].astype(str).str.strip().ne("")]
-    return out.drop_duplicates(subset=["Data", "Time_A", "Time_B"]).reset_index(drop=True)
+    out = out.drop_duplicates(subset=["Data", "Hora", "Fase", "Time_A", "Time_B"]).reset_index(drop=True)
+    out["Ordem"] = range(1, len(out) + 1)
+
+    # Se a aba veio quase toda como texto bruto, o parser textual costuma ser mais completo.
+    parsed = _parse_jogos_fifa_de_dataframe_local(d, fonte="copa2026_jogos_fifa_texto_bruto")
+    if len(parsed) > len(out):
+        return parsed
+    return out
 
 
 def _parse_page_text_scores_fixtures_local(xls: pd.ExcelFile) -> pd.DataFrame:
-    if "page_text_scores_fixtures" not in xls.sheet_names:
-        return pd.DataFrame(columns=["Data", "Grupo", "Time_A", "Time_B", "Gols_A", "Gols_B", "Status", "Fonte"])
-    try:
-        d = pd.read_excel(xls, sheet_name="page_text_scores_fixtures")
-    except Exception:
-        return pd.DataFrame(columns=["Data", "Grupo", "Time_A", "Time_B", "Gols_A", "Gols_B", "Status", "Fonte"])
-    if d.empty:
-        return pd.DataFrame(columns=["Data", "Grupo", "Time_A", "Time_B", "Gols_A", "Gols_B", "Status", "Fonte"])
-    text = " ".join(d.astype(str).fillna("").agg(" ".join, axis=1).tolist())
-    text = re.sub(r"\s+", " ", text)
-    date_pat = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+\d{1,2}\s+[A-Za-z]+\s+2026"
-    parts = list(re.finditer(date_pat, text))
-    rows = []
-    for i, m in enumerate(parts):
-        data = m.group(0)
-        start = m.end()
-        end = parts[i + 1].start() if i + 1 < len(parts) else len(text)
-        seg = text[start:end]
-        match_pat = re.compile(
-            r"(?P<a>[A-Za-zÀ-ÖØ-öø-ÿ'’\.\- ]+?)\s+(?P<ga>\d+)\s+FT\s+(?P<gb>\d+)\s+(?P<b>[A-Za-zÀ-ÖØ-öø-ÿ'’\.\- ]+?)\s+First Stage\s+·\s+Group\s+(?P<g>[A-L])\s+·\s+(?P<stadium>.*?)(?=(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’\.\- ]+?\s+\d+\s+FT\s+\d+\s+)|$)"
-        )
-        for mm in match_pat.finditer(seg):
-            a = _canonical_team_local(mm.group("a"))
-            b = _canonical_team_local(mm.group("b"))
-            if not a or not b:
-                continue
-            rows.append({
-                "Data": data,
-                "Grupo": mm.group("g"),
-                "Time_A": a,
-                "Time_B": b,
-                "Gols_A": int(mm.group("ga")),
-                "Gols_B": int(mm.group("gb")),
-                "Status": "FT",
-                "Estadio": mm.group("stadium").strip()[:180],
-                "Fonte": "page_text_scores_fixtures",
-            })
-    if not rows:
-        return pd.DataFrame(columns=["Data", "Grupo", "Time_A", "Time_B", "Gols_A", "Gols_B", "Status", "Fonte"])
-    return pd.DataFrame(rows).drop_duplicates(subset=["Data", "Time_A", "Time_B"]).reset_index(drop=True)
+    textos = []
+    for sheet in ["page_text_scores_fixtures", "copa2026_jogos_fifa"]:
+        if sheet not in xls.sheet_names:
+            continue
+        try:
+            d = pd.read_excel(xls, sheet_name=sheet)
+        except Exception:
+            continue
+        for col in ["trecho", "texto", "Texto", "text", "content"]:
+            if col in d.columns:
+                textos.extend(d[col].dropna().astype(str).tolist())
+    return _parse_textos_jogos_fifa_local(textos, fonte="page_text_scores_fixtures")
 
 
 def _calcular_classificados_copa_local(standings: pd.DataFrame) -> pd.DataFrame:
@@ -1086,8 +1313,9 @@ def carregar_estado_copa_2026_local(uploaded_file) -> dict[str, pd.DataFrame]:
         standings = standings_dom
 
     jogos = _padronizar_jogos_copa_local(raw_jogos)
-    if jogos.empty:
-        jogos = _parse_page_text_scores_fixtures_local(xls)
+    jogos_texto = _parse_page_text_scores_fixtures_local(xls)
+    if jogos.empty or len(jogos_texto) > len(jogos):
+        jogos = jogos_texto
 
     if standings.empty and not raw_eq.empty:
         col_eq = _encontrar_coluna_local(raw_eq, ["Equipe", "Seleção", "Selecao", "Team", "Country", "Nation"])
@@ -1291,6 +1519,10 @@ def treinar_modelos() -> None:
     )
     grupos_copa = st.session_state.get("df_copa2026_classificacao")
     equipes_copa = st.session_state.get("equipes_copa_2026", []) or []
+    jogos_copa = None
+    if isinstance(st.session_state.get("internet_extras"), dict):
+        jogos_copa = st.session_state.internet_extras.get("copa2026_jogos_fifa")
+    classificados_copa = st.session_state.get("df_copa2026_classificados")
 
     st.session_state.simulador_copa = WorldCupFormatSimulator(
         poisson_model=poisson_model,
@@ -1299,6 +1531,8 @@ def treinar_modelos() -> None:
         random_state=42,
         equipes_copa=equipes_copa,
         grupos_copa=grupos_copa if isinstance(grupos_copa, pd.DataFrame) and not grupos_copa.empty else None,
+        jogos_copa=jogos_copa if isinstance(jogos_copa, pd.DataFrame) and not jogos_copa.empty else None,
+        classificados_copa=classificados_copa if isinstance(classificados_copa, pd.DataFrame) and not classificados_copa.empty else None,
     )
 
 
@@ -1311,6 +1545,10 @@ def recriar_simulador_copa_com_estado_fifa() -> None:
 
     grupos_copa = st.session_state.get("df_copa2026_classificacao")
     equipes_copa = st.session_state.get("equipes_copa_2026", []) or []
+    jogos_copa = None
+    if isinstance(st.session_state.get("internet_extras"), dict):
+        jogos_copa = st.session_state.internet_extras.get("copa2026_jogos_fifa")
+    classificados_copa = st.session_state.get("df_copa2026_classificados")
 
     st.session_state.simulador_copa = WorldCupFormatSimulator(
         poisson_model=st.session_state.poisson_model,
@@ -1319,6 +1557,8 @@ def recriar_simulador_copa_com_estado_fifa() -> None:
         random_state=42,
         equipes_copa=equipes_copa,
         grupos_copa=grupos_copa if isinstance(grupos_copa, pd.DataFrame) and not grupos_copa.empty else None,
+        jogos_copa=jogos_copa if isinstance(jogos_copa, pd.DataFrame) and not jogos_copa.empty else None,
+        classificados_copa=classificados_copa if isinstance(classificados_copa, pd.DataFrame) and not classificados_copa.empty else None,
     )
 
 def dataframe_to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
