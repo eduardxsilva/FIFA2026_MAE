@@ -1,0 +1,44 @@
+# Credenciais e configurações locais
+.env
+.env.*
+*.env
+!.env.example
+.streamlit/secrets.toml
+secrets.toml
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Arquivos gerados pelo aplicativo
+*.xlsx
+*.xls
+*.csv
+debug_fifa_pages/
+dist/
+build/
+*.spec
+
+# Editores e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs e temporários
+*.log
+*.tmp
+*.temp
+~$*

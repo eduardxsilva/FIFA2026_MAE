@@ -1417,22 +1417,32 @@ def carregar_excel_fifa_gerado_completo(uploaded_file) -> tuple[pd.DataFrame, di
     xls = pd.ExcelFile(BytesIO(data))
     sheets_lower = {s.lower(): s for s in xls.sheet_names}
 
-    if "base_historica_2018" in sheets_lower:
-        df_base = pd.read_excel(xls, sheet_name=sheets_lower["base_historica_2018"])
-        tmp_buffer = BytesIO()
-        df_base.to_excel(tmp_buffer, index=False)
-        tmp_buffer.seek(0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-            tmp.write(tmp_buffer.getvalue())
-            tmp_path = tmp.name
+    tmp_path = None
+    try:
+        if "base_historica_2018" in sheets_lower:
+            df_base = pd.read_excel(xls, sheet_name=sheets_lower["base_historica_2018"])
+            tmp_buffer = BytesIO()
+            df_base.to_excel(tmp_buffer, index=False)
+            tmp_buffer.seek(0)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+                tmp.write(tmp_buffer.getvalue())
+                tmp_path = tmp.name
+        else:
+            suffix = Path(uploaded_file.name).suffix.lower()
+            if suffix not in {".xlsx", ".xls", ".csv"}:
+                raise ValueError("Formato de arquivo não permitido.")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+
         loader = MatchDataLoader()
         df_matches = loader.carregar_arquivo(tmp_path)
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix.lower()) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        loader = MatchDataLoader()
-        df_matches = loader.carregar_arquivo(tmp_path)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     extras = {}
     try:

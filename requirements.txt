@@ -9,3 +9,5 @@ beautifulsoup4
 lxml
 plotly
 streamlit-option-menu
+selenium
+webdriver-manager

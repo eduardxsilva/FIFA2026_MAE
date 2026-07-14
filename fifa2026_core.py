@@ -1155,13 +1155,19 @@ class BettingOddsExtractor:
 
     def _get_json(self, url: str, params: Dict[str, Any], log: List[str]) -> Any:
         clean_params = {k: v for k, v in params.items() if v not in (None, "", [], {})}
-        resp = requests.get(url, params=clean_params, headers=self.headers, timeout=self.timeout)
+        try:
+            resp = requests.get(url, params=clean_params, headers=self.headers, timeout=self.timeout)
+        except requests.RequestException as exc:
+            # Não propaga URL/consulta completas: parâmetros podem conter a API key.
+            raise RuntimeError("Falha de comunicação com o provedor de odds.") from exc
         remaining = resp.headers.get("x-requests-remaining") or resp.headers.get("x-ratelimit-remaining")
         used = resp.headers.get("x-requests-used") or resp.headers.get("x-ratelimit-used")
         if remaining is not None or used is not None:
             log.append(f"Cota odds: usadas={used or 'n/d'} restantes={remaining or 'n/d'}.")
         if resp.status_code >= 400:
             detalhe = (resp.text or "")[:600]
+            if self.api_key:
+                detalhe = detalhe.replace(self.api_key, "[REDACTED]")
             raise RuntimeError(f"HTTP {resp.status_code}: {detalhe}")
         return resp.json()
 

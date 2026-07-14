@@ -47,6 +47,10 @@ FIFA2026_MAE/
 │   └── config.toml       # Tema e configuração visual do Streamlit
 ├── fifa2026_core.py      # Extração, tratamento, modelos e simuladores
 ├── streamlit_app.py      # Interface web e fluxo da aplicação
+├── gerador_excel_fifa2026_edge_v5.py
+│                          # Gerador local de dados via Edge/Selenium
+├── corrigir_excel_fifa2026_standings.py
+│                          # Correção de standings em Excel já gerado
 ├── requirements.txt      # Dependências Python
 └── README.md
 ```
@@ -153,6 +157,10 @@ ODDS_API_KEY = "sua_chave"
 ```
 
 Nunca publique chaves no código, no README, no histórico do Git ou em arquivos versionados. As odds funcionam como leitura complementar do mercado; o placar provável continua sendo produzido pelo modelo estatístico.
+
+O arquivo `.streamlit/secrets.toml`, planilhas, logs e saídas de depuração estão
+incluídos no `.gitignore`. Mesmo assim, revise o conteúdo preparado com
+`git status` antes de cada commit.
 
 ## Validação
 
