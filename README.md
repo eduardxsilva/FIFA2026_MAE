@@ -11,7 +11,7 @@ O projeto possui interface desenvolvida em Streamlit e reúne modelos de Elo din
 - Importação de uma base histórica em CSV ou Excel;
 - leitura de colunas equivalentes em português ou inglês;
 - importação de um Excel consolidado com histórico, estado da Copa e métricas FIFA;
-- extração alternativa de dados históricos da internet;
+- extração alternativa de dados históricos e do estado da Copa pela internet, sem navegador no Streamlit;
 - cálculo e visualização do ranking Elo;
 - previsão de confrontos entre duas equipes;
 - probabilidades de vitória, empate e derrota;
@@ -188,6 +188,8 @@ Resultados de validação dependem diretamente da cobertura, consistência e atu
 ## Limitações
 
 - O desempenho depende da qualidade e da quantidade dos jogos importados;
+- A atualização online usa o conjunto público `international_results`; a consulta às páginas FIFA é complementar, pois o HTML dinâmico pode mudar sem aviso;
+- Na fonte pública, gols são usados como proxy quando não existe xG e ficam marcados em `xg_origem`; não devem ser interpretados como xG observado;
 - escalações, lesões, suspensões e decisões táticas podem não estar representadas;
 - dados extraídos de páginas externas podem deixar de funcionar quando os sites mudarem;
 - APIs de odds exigem chave própria e podem possuir limites ou custos;

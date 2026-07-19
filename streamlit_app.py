@@ -1935,17 +1935,15 @@ elif page == "Importar dados":
         st.markdown(
             "Modo alternativo: baixar base histórica da internet. Para a Copa/FIFA, prefira o arquivo único local; é mais estável que scraping no Streamlit Cloud."
         )
-        c1, c2, c3 = st.columns([1, 1, 2])
+        c1, c2 = st.columns(2)
         with c1:
             ano_minimo = st.number_input("Ano mínimo", min_value=1872, max_value=2030, value=2018, step=1)
         with c2:
             incluir_fifa = st.checkbox("Consultar FIFA junto", value=False)
-        with c3:
-            renderizar_js = st.checkbox(
-                "Renderizar JavaScript da FIFA com Selenium",
-                value=False,
-                help="Use somente se o ambiente tiver Selenium e navegador disponível. No Streamlit Cloud, pode falhar."
-            )
+        renderizar_js = False
+        st.caption(
+            "Os jogos e grupos da Copa são montados pela base pública. A consulta FIFA é complementar e não usa Selenium no Streamlit."
+        )
 
         if st.button("Extrair base histórica da internet", type="secondary", width="stretch", icon=":material/cloud_download:"):
             try:

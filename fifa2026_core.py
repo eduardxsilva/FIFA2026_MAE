@@ -414,8 +414,10 @@ class InternetExtractionResult:
 
 class InternetDataExtractor:
     """
-    Baixa uma base histórica internacional para treino e, quando solicitado,
-    consulta as páginas públicas da FIFA no momento do clique.
+    Baixa uma base internacional para treino e monta o estado da Copa de 2026
+    diretamente dos jogos publicados nessa base. A consulta ao site da FIFA é
+    apenas complementar, porque suas páginas são dinâmicas e não oferecem uma
+    tabela HTML estável para o Streamlit Cloud.
 
     Importante:
     - A base de treino continua vindo do CSV histórico.
@@ -463,15 +465,24 @@ class InternetDataExtractor:
 
         matches = self._padronizar_resultados_internacionais(base_bruta, ano_minimo, log)
 
+        # A própria base pública contém jogos concluídos e partidas agendadas da
+        # Copa de 2026. Este caminho não exige navegador nem chave de API.
+        estado_copa_publico = self._montar_estado_copa_2026_resultados(base_bruta, log)
+        extras.update(estado_copa_publico)
+
         if incluir_fifa:
             fifa_extras = self._baixar_tabelas_fifa(log, renderizar_js=self.renderizar_js)
             extras.update(fifa_extras)
             estado_copa = self._montar_estado_copa_2026(fifa_extras, log)
-            extras.update(estado_copa)
+            # Dados oficiais extraídos com sucesso têm prioridade. Se a FIFA
+            # entregar apenas a casca HTML, preservamos o estado da base pública.
+            for chave, tabela in estado_copa.items():
+                if isinstance(tabela, pd.DataFrame) and not tabela.empty:
+                    extras[chave] = tabela
 
         log.append(f"Base final padronizada: {len(matches)} partidas.")
         log.append(f"Equipes únicas: {len(set(matches['home_team']).union(set(matches['away_team'])))}.")
-        log.append("Observação: quando não há xG público na fonte, home_xg e away_xg usam os gols como aproximação.")
+        log.append("Aviso metodológico: a fonte não contém xG real; os gols são usados como proxy e identificados por xg_origem.")
 
         extras["internet_log"] = pd.DataFrame({"log": log})
 
@@ -552,6 +563,119 @@ class InternetDataExtractor:
             raise ValueError("A base online foi baixada, mas nenhuma partida válida restou após limpeza.")
 
         return out.reset_index(drop=True)
+
+    def _montar_estado_copa_2026_resultados(
+        self, df: pd.DataFrame, log: List[str]
+    ) -> Dict[str, pd.DataFrame]:
+        """Monta grupos, classificação e fixtures da Copa 2026 sem Selenium."""
+        col_date = encontrar_coluna(df, ["date", "data"])
+        col_home = encontrar_coluna(df, ["home_team", "mandante", "home"])
+        col_away = encontrar_coluna(df, ["away_team", "visitante", "away"])
+        col_hg = encontrar_coluna(df, ["home_score", "home_goals", "gols_casa"])
+        col_ag = encontrar_coluna(df, ["away_score", "away_goals", "gols_fora"])
+        col_comp = encontrar_coluna(df, ["tournament", "competition", "competicao"])
+        if any(c is None for c in [col_date, col_home, col_away, col_hg, col_ag, col_comp]):
+            log.append("Copa 2026: a base pública não possui as colunas necessárias para montar grupos.")
+            return {}
+
+        jogos = pd.DataFrame({
+            "Data": pd.to_datetime(df[col_date], errors="coerce"),
+            "Time_A": df[col_home].apply(canonical_team_name),
+            "Time_B": df[col_away].apply(canonical_team_name),
+            "Gols_A": pd.to_numeric(df[col_hg], errors="coerce"),
+            "Gols_B": pd.to_numeric(df[col_ag], errors="coerce"),
+            "Competicao": df[col_comp].astype(str).str.strip(),
+        })
+        jogos = jogos[
+            jogos["Competicao"].str.fullmatch("FIFA World Cup", case=False, na=False)
+            & jogos["Data"].dt.year.eq(2026)
+            & jogos["Time_A"].ne("")
+            & jogos["Time_B"].ne("")
+        ].sort_values("Data", kind="stable").reset_index(drop=True)
+        if len(jogos) < 72:
+            log.append(f"Copa 2026: somente {len(jogos)} jogos encontrados; são necessários 72 para inferir os grupos.")
+            return {}
+
+        # No formato de 48 seleções, os 72 primeiros jogos são a fase de grupos.
+        fase_grupos = jogos.iloc[:72].copy()
+        adj: Dict[str, set] = {}
+        ordem: List[str] = []
+        for _, r in fase_grupos.iterrows():
+            a, b = r["Time_A"], r["Time_B"]
+            if a not in adj:
+                adj[a] = set(); ordem.append(a)
+            if b not in adj:
+                adj[b] = set(); ordem.append(b)
+            adj[a].add(b); adj[b].add(a)
+
+        componentes: List[List[str]] = []
+        visitados = set()
+        for inicio in ordem:
+            if inicio in visitados:
+                continue
+            pilha, comp = [inicio], []
+            while pilha:
+                atual = pilha.pop()
+                if atual in visitados:
+                    continue
+                visitados.add(atual); comp.append(atual)
+                pilha.extend(x for x in adj.get(atual, set()) if x not in visitados)
+            componentes.append(comp)
+
+        if len(componentes) != 12 or any(len(c) != 4 for c in componentes):
+            log.append("Copa 2026: não foi possível inferir 12 grupos de quatro seleções com segurança.")
+            return {}
+
+        mapa_grupo = {
+            equipe: chr(ord("A") + indice)
+            for indice, comp in enumerate(componentes)
+            for equipe in comp
+        }
+        fase_grupos["Grupo"] = fase_grupos["Time_A"].map(mapa_grupo)
+        jogos["Grupo"] = np.where(jogos.index < 72, jogos["Time_A"].map(mapa_grupo).fillna(""), "")
+        jogos["Fase"] = np.where(jogos.index < 72, "Fase de grupos", "Mata-mata")
+        jogos["Status"] = np.where(jogos[["Gols_A", "Gols_B"]].notna().all(axis=1), "Concluído", "Agendado")
+        jogos["Fonte"] = "international_results_public_dataset"
+
+        linhas = []
+        for grupo, equipes in pd.Series(mapa_grupo).groupby(lambda e: mapa_grupo[e]):
+            tabela = {e: {"Jogos": 0, "Vitorias": 0, "Empates": 0, "Derrotas": 0, "GP": 0, "GC": 0, "Pontos": 0} for e in equipes.index}
+            concluidos = fase_grupos[
+                fase_grupos["Grupo"].eq(grupo)
+                & fase_grupos[["Gols_A", "Gols_B"]].notna().all(axis=1)
+            ]
+            for _, r in concluidos.iterrows():
+                a, b, ga, gb = r["Time_A"], r["Time_B"], int(r["Gols_A"]), int(r["Gols_B"])
+                tabela[a]["Jogos"] += 1; tabela[b]["Jogos"] += 1
+                tabela[a]["GP"] += ga; tabela[a]["GC"] += gb
+                tabela[b]["GP"] += gb; tabela[b]["GC"] += ga
+                if ga > gb:
+                    tabela[a]["Vitorias"] += 1; tabela[a]["Pontos"] += 3; tabela[b]["Derrotas"] += 1
+                elif gb > ga:
+                    tabela[b]["Vitorias"] += 1; tabela[b]["Pontos"] += 3; tabela[a]["Derrotas"] += 1
+                else:
+                    tabela[a]["Empates"] += 1; tabela[b]["Empates"] += 1
+                    tabela[a]["Pontos"] += 1; tabela[b]["Pontos"] += 1
+            temp = []
+            for equipe, stats in tabela.items():
+                temp.append({"Grupo": grupo, "Equipe": equipe, **stats, "SG": stats["GP"] - stats["GC"]})
+            temp = sorted(temp, key=lambda x: (x["Pontos"], x["SG"], x["GP"]), reverse=True)
+            for pos, row in enumerate(temp, 1):
+                row["Posicao_Grupo"] = pos
+                row["Fonte_Tabela"] = "resultados públicos (classificação calculada)"
+                linhas.append(row)
+
+        standings = pd.DataFrame(linhas).sort_values(["Grupo", "Posicao_Grupo"]).reset_index(drop=True)
+        equipes = standings[["Equipe"]].drop_duplicates().sort_values("Equipe").reset_index(drop=True)
+        equipes["Fonte"] = "international_results_public_dataset"
+        classificados = self._calcular_classificados_atuais(standings)
+        log.append(f"Copa 2026: {len(jogos)} jogos e {len(equipes)} seleções carregados sem Selenium.")
+        return {
+            "copa2026_classificacao_atual": standings,
+            "copa2026_equipes_oficiais": equipes,
+            "copa2026_jogos_fifa": jogos,
+            "copa2026_classificados_atuais": classificados,
+        }
 
     def extrair_fifa_ao_vivo(self, renderizar_js: Optional[bool] = None) -> InternetExtractionResult:
         """
